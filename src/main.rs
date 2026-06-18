@@ -61,6 +61,7 @@ fn main() {
         store: Mutex::new(store),
         subs: Mutex::new(registry),
         resolve_cache: Mutex::new(load_cache(&cfg.storage_dir)),
+        reconcile_lock: Mutex::new(()),
     });
 
     {
@@ -102,8 +103,11 @@ fn worker(server: &tiny_http::Server, app: &App) {
         match server.recv() {
             Ok(req) => http::handle(app, req),
             Err(e) => {
-                eprintln!("[server] recv error: {}", e);
-                break;
+                // A failed accept on a bound listener is effectively fatal. Exit
+                // so systemd restarts us cleanly rather than silently shedding an
+                // accept thread (or hanging in join() while the others block).
+                eprintln!("[server] fatal recv error: {}; exiting for restart", e);
+                std::process::exit(1);
             }
         }
     }

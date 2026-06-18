@@ -11,7 +11,7 @@ use std::io::Read;
 use tiny_http::{Header, Method, Request, Response};
 
 use crate::app::App;
-use crate::util::{json_string, now_unix, query_get};
+use crate::util::{ct_eq, json_string, now_unix, query_get};
 
 const MAX_BODY: u64 = 1024 * 1024;
 
@@ -30,7 +30,7 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
     let authed = req
         .headers()
         .iter()
-        .any(|h| h.field.equiv("Authorization") && h.value.as_str() == expected);
+        .any(|h| h.field.equiv("Authorization") && ct_eq(h.value.as_str().as_bytes(), expected.as_bytes()));
     if !authed {
         json_response(req, 401, "{\"error\":\"unauthorized\"}".to_string());
         return;
@@ -97,8 +97,9 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
         (Method::Post, "/api/channels") => {
             let body = read_body(&mut req);
             let channels = extract_string_array(&body);
-            // Persist to the channels file (single source of truth) then reconcile.
-            let content = channels.join("\n") + "\n";
+            // Persist to the channels file (single source of truth) then
+            // reconcile, preserving any operator comment/blank lines.
+            let content = render_channels_file(&app.cfg.channels_file, &channels);
             if let Err(e) = std::fs::write(&app.cfg.channels_file, content) {
                 json_response(
                     req,
@@ -126,6 +127,27 @@ fn read_body(req: &mut Request) -> String {
     let mut body = Vec::new();
     let _ = req.as_reader().take(MAX_BODY).read_to_end(&mut body);
     String::from_utf8_lossy(&body).into_owned()
+}
+
+/// Build the new channels.txt: keep the existing comment/blank lines (operator
+/// documentation), then list the new active channel set. The active entries are
+/// replaced wholesale; comments survive.
+fn render_channels_file(path: &str, channels: &[String]) -> String {
+    let mut out = String::new();
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        for line in existing.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for c in channels {
+        out.push_str(c);
+        out.push('\n');
+    }
+    out
 }
 
 fn extract_u64(text: &str, key: &str) -> Option<u64> {
@@ -204,5 +226,21 @@ mod tests {
         assert_eq!(extract_u64(r#"{"through": 42}"#, "through"), Some(42));
         assert_eq!(extract_u64(r#"{"through":7,"x":1}"#, "through"), Some(7));
         assert_eq!(extract_u64(r#"{"x":1}"#, "through"), None);
+    }
+
+    #[test]
+    fn render_channels_preserves_comments() {
+        let dir = std::env::temp_dir().join("yt_websub_test_render");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("channels.txt");
+        std::fs::write(&path, "# my notes\n\nUColdoldoldoldoldoldold0\n").unwrap();
+        let out = render_channels_file(
+            path.to_str().unwrap(),
+            &["UCnewnewnewnewnewnewnew0".to_string()],
+        );
+        assert!(out.contains("# my notes"));
+        assert!(out.contains("UCnewnewnewnewnewnewnew0"));
+        assert!(!out.contains("UColdoldoldoldoldoldold0")); // old active entry replaced
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

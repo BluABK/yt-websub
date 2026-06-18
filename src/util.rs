@@ -131,6 +131,19 @@ pub fn query_get(query: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Constant-time byte-equality, so comparing the bearer token doesn't leak its
+/// length/contents through timing. (HMAC verification already uses a CT compare.)
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Render `s` as a quoted, escaped JSON string (including the surrounding quotes).
 pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -188,5 +201,13 @@ mod tests {
     fn json_escaping() {
         assert_eq!(json_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(json_string("line\nbreak"), "\"line\\nbreak\"");
+    }
+
+    #[test]
+    fn ct_eq_matches_semantics() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
     }
 }

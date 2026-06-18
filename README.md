@@ -112,7 +112,9 @@ Edit `channels.txt` (one `UC...`, `@handle`, or channel URL per line). The serve
 renews the rest. Handles/URLs are resolved to `UC...` ids and cached in `resolve.cache`.
 
 Alternatively drive it from the API (this is how streamarchiver will manage it):
-`POST /api/channels` overwrites `channels.txt` and reconciles immediately.
+`POST /api/channels` replaces the active entries in `channels.txt` and reconciles
+immediately. Operator comment/blank lines in the file are preserved; only the
+channel entries are rewritten.
 
 ## HTTP API (consumed by streamarchiver)
 

@@ -13,4 +13,7 @@ pub struct App {
     pub store: Mutex<Store>,
     pub subs: Mutex<Registry>,
     pub resolve_cache: Mutex<HashMap<String, String>>,
+    /// Serializes whole `reconcile` runs (API-driven vs. the renewal thread) so
+    /// they can't both subscribe the same new channel concurrently.
+    pub reconcile_lock: Mutex<()>,
 }

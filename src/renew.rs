@@ -16,6 +16,7 @@ use crate::{hub, resolve, subs};
 const RENEW_TICK: u64 = 60; // seconds between wakeups
 const RENEW_LEAD: u64 = 24 * 3600; // renew when < 1 day of lease remains
 const PENDING_TIMEOUT: u64 = 600; // re-send if a subscribe was never verified
+const RENEW_COOLDOWN: u64 = 300; // wait after a (re)subscribe send before retrying
 const COMPACT_EVERY_TICKS: u64 = 60; // ~hourly
 
 fn backoff(fail_count: u32) -> u64 {
@@ -43,11 +44,15 @@ fn save_cache(dir: &str, cache: &HashMap<String, String>) {
     let _ = fs::write(Path::new(dir).join("resolve.cache"), out);
 }
 
-/// Read channels.txt and resolve every entry to a `UCxxxx` id.
-fn desired_set(app: &App) -> Vec<String> {
+/// Read channels.txt and resolve every entry to a `UCxxxx` id. The bool is
+/// `complete`: false if any non-comment line failed to resolve, in which case
+/// the caller must NOT treat the set as authoritative for removals (a transient
+/// resolution failure must never unsubscribe a healthy channel).
+fn desired_set(app: &App) -> (Vec<String>, bool) {
     let content = fs::read_to_string(&app.cfg.channels_file).unwrap_or_default();
     let mut cache = app.resolve_cache.lock().unwrap();
     let mut out: Vec<String> = Vec::new();
+    let mut complete = true;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -56,17 +61,22 @@ fn desired_set(app: &App) -> Vec<String> {
         match resolve::resolve(line, &mut cache) {
             Some(uc) if !out.contains(&uc) => out.push(uc),
             Some(_) => {}
-            None => eprintln!("[reconcile] could not resolve channel: {}", line),
+            None => {
+                complete = false;
+                eprintln!("[reconcile] could not resolve channel: {}", line);
+            }
         }
     }
     save_cache(&app.cfg.storage_dir, &cache);
-    out
+    (out, complete)
 }
 
 /// Diff the desired set against the registry, subscribing new channels and
 /// unsubscribing removed ones. Returns (subscribed, unsubscribed, active_count).
 pub fn reconcile(app: &App) -> (usize, usize, usize) {
-    let desired = desired_set(app);
+    // Serialize whole reconciles so API-driven and timer-driven runs don't race.
+    let _guard = app.reconcile_lock.lock().unwrap();
+    let (desired, complete) = desired_set(app);
 
     let (to_add, to_remove): (Vec<String>, Vec<subs::Sub>) = {
         let reg = app.subs.lock().unwrap();
@@ -75,12 +85,18 @@ pub fn reconcile(app: &App) -> (usize, usize, usize) {
             .filter(|d| !reg.subs.contains_key(*d))
             .cloned()
             .collect();
-        let removes = reg
-            .subs
-            .values()
-            .filter(|s| !desired.contains(&s.channel_id))
-            .cloned()
-            .collect();
+        // Only remove subs when the desired set is complete; otherwise a failed
+        // resolution this cycle would wrongly drop a still-wanted channel.
+        let removes = if complete {
+            reg.subs
+                .values()
+                .filter(|s| !desired.contains(&s.channel_id))
+                .cloned()
+                .collect()
+        } else {
+            eprintln!("[reconcile] desired set incomplete (resolution failures); skipping removals");
+            Vec::new()
+        };
         (adds, removes)
     };
 
@@ -152,12 +168,14 @@ fn renew_due(app: &App) {
         match hub::send(&app.cfg, &s, "subscribe") {
             Ok(code) if hub::is_ok(code) => {
                 // The verify GET will (re)set active + expires_at. An active sub
-                // stays active in the meantime, so there is no coverage gap.
+                // stays active in the meantime, so there is no coverage gap. Set
+                // a cooldown so we don't re-send every tick while the verify GET
+                // is in flight (or if the callback is briefly unreachable).
                 if !was_active {
                     s.state = "pending".into();
                 }
                 s.fail_count = 0;
-                s.next_attempt_at = 0;
+                s.next_attempt_at = now_unix() + RENEW_COOLDOWN;
             }
             Ok(code) => {
                 eprintln!("[renew] {} -> HTTP {}", s.channel_id, code);

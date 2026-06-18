@@ -17,11 +17,16 @@ pub fn is_channel_id(s: &str) -> bool {
 }
 
 /// Find a 24-char `UC...` id following any known marker in arbitrary text/HTML.
+/// Markers are tried in priority order: the page's own canonical/og:url link and
+/// `externalId` (authoritative for the channel the page belongs to) before the
+/// generic `/channel/UC`, which could otherwise first match a *linked* channel.
 pub fn extract_uc(text: &str) -> Option<String> {
     for marker in [
-        "/channel/UC",
-        "\"channelId\":\"UC",
+        "rel=\"canonical\" href=\"https://www.youtube.com/channel/UC",
+        "property=\"og:url\" content=\"https://www.youtube.com/channel/UC",
         "\"externalId\":\"UC",
+        "\"channelId\":\"UC",
+        "/channel/UC",
         "channel_id=UC",
     ] {
         if let Some(pos) = text.find(marker) {
