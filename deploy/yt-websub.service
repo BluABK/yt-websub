@@ -1,0 +1,46 @@
+[Unit]
+Description=YouTube WebSub (PubSubHubbub) notification server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yt-websub
+Group=yt-websub
+EnvironmentFile=/etc/yt-websub.env
+ExecStart=/usr/local/bin/yt-websub
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yt-websub
+
+# Persistent state -> /var/lib/yt-websub, created and owned by the service user.
+StateDirectory=yt-websub
+
+# Bind :443 without full root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandboxing.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/yt-websub
+# Read the Let's Encrypt material (needed to load the cert at startup).
+ReadOnlyPaths=/etc/letsencrypt
+MemoryMax=64M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

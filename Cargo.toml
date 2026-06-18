@@ -1,0 +1,25 @@
+[package]
+name = "yt-websub"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal YouTube WebSub (PubSubHubbub) notification server for streamarchiver"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[dependencies]
+# Blocking HTTP/1.1 server with correct framing + HTTPS (rustls) for the single :443 listener.
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+# Blocking HTTPS client (rustls) for outbound subscribe/renew + handle resolution.
+ureq = "2"
+# X-Hub-Signature HMAC-SHA1 verification (RustCrypto; tiny, pure Rust).
+hmac = "0.12"
+sha1 = "0.10"
+# OS RNG for per-subscription secrets/tokens (cross-platform).
+getrandom = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

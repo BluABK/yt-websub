@@ -1,0 +1,15 @@
+# Desired YouTube channels to receive WebSub notifications for.
+# One per line. Blank lines and lines starting with '#' are ignored.
+# Each entry may be:
+#   - a canonical channel id:   UCXXXXXXXXXXXXXXXXXXXXXX
+#   - a handle:                 @SomeChannel
+#   - a channel URL:            https://www.youtube.com/@SomeChannel
+#                               https://www.youtube.com/channel/UCXXXXXXXXXXXXXXXXXXXXXX
+# Handles/URLs are resolved to UC... ids automatically (cached in resolve.cache).
+#
+# The server reconciles subscriptions whenever this file's mtime changes
+# (checked every ~60s) and on startup. Removing a line unsubscribes that channel.
+
+# UCBJycsmduvYEL83R_U4JriQ
+# @MarquesBrownlee
+# https://www.youtube.com/@LinusTechTips
