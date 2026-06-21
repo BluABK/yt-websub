@@ -37,8 +37,8 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 ReadWritePaths=/var/lib/yt-websub
-# Read the Let's Encrypt material (needed to load the cert at startup).
-ReadOnlyPaths=/etc/letsencrypt
+# Cert + key are copied into /var/lib/yt-websub by the certbot deploy hook, so
+# no access to /etc/letsencrypt is needed here.
 MemoryMax=64M
 TasksMax=32
 

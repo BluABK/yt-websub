@@ -49,44 +49,56 @@ Build on the VPS, or cross-compile and copy the binary to `/usr/local/bin/yt-web
 
 ### 1. DNS + TLS (Let's Encrypt)
 
-Point a record (e.g. `hooks.example.com`) at the VPS, then issue a cert:
+Point an **A record** (e.g. `hooks.example.com`) at the VPS — needed so the hub and streamarchiver
+can reach `:443`. Then issue the cert with the **DNS-01** challenge so **no inbound port (not even 80)
+is ever required**. Example for Cloudflare DNS (swap `--dns-cloudflare` for your provider's plugin):
 
 ```sh
-apt-get install -y certbot
-certbot certonly --standalone -d hooks.example.com
-# HTTP-01 needs port 80 reachable during issuance/renewal.
-# Prefer DNS-01 (certbot --dns-<provider>) if you'd rather not open 80.
+apt-get install -y certbot python3-certbot-dns-cloudflare
+
+# Cloudflare API token scoped to Zone:DNS:Edit on your zone:
+printf 'dns_cloudflare_api_token = REPLACE_with_token\n' > /etc/letsencrypt/cloudflare.ini
+chmod 600 /etc/letsencrypt/cloudflare.ini
+
+certbot certonly \
+  --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+  --dns-cloudflare-propagation-seconds 30 \
+  -d hooks.example.com
+# -> /etc/letsencrypt/live/hooks.example.com/{fullchain,privkey}.pem
 ```
 
-Make the live cert reload automatically on renewal:
+Let's Encrypt keys are root-only, so the service reads **copies** under `/var/lib/yt-websub/` (which
+`YTWEBSUB_TLS_*` already point at). The initial copy is made in step 2; automatic refresh on renewal
+is wired up in **step 4** — *after* the service exists, so the hook's restart has something to
+restart. (Don't create the deploy hook yet.)
 
-```sh
-# /etc/letsencrypt/renewal-hooks/deploy/restart-yt-websub.sh  (chmod +x)
-systemctl restart yt-websub
-```
-
-(Restart is cheap; subscriptions reload from disk, so no events are lost.)
+> Avoid `certbot --manual --preferred-challenge dns` — it makes you paste a TXT record by hand on
+> every renewal. Use a provider plugin so renewals stay unattended.
 
 ### 2. Service user, config, state
 
 ```sh
 useradd --system --no-create-home --shell /usr/sbin/nologin yt-websub
 install -d -o yt-websub -g yt-websub -m 0750 /var/lib/yt-websub
+install -m 0755 target/release/yt-websub /usr/local/bin/yt-websub
+
+# Initial cert copy (step 4's hook refreshes these automatically on renewal):
+install -o yt-websub -g yt-websub -m 0644 \
+  /etc/letsencrypt/live/hooks.example.com/fullchain.pem /var/lib/yt-websub/cert.pem
+install -o yt-websub -g yt-websub -m 0600 \
+  /etc/letsencrypt/live/hooks.example.com/privkey.pem  /var/lib/yt-websub/key.pem
 
 cp deploy/yt-websub.env.example /etc/yt-websub.env
 chown root:yt-websub /etc/yt-websub.env && chmod 0640 /etc/yt-websub.env
-# Edit /etc/yt-websub.env: set YTWEBSUB_CALLBACK_BASE, the TLS paths, and a
-# strong YTWEBSUB_BEARER_TOKEN (openssl rand -hex 32).
+# Edit /etc/yt-websub.env: set YTWEBSUB_CALLBACK_BASE and a strong
+# YTWEBSUB_BEARER_TOKEN (openssl rand -hex 32). The TLS paths already point at
+# the /var/lib/yt-websub copies.
 
 cp deploy/channels.txt.example /var/lib/yt-websub/channels.txt
 chown yt-websub:yt-websub /var/lib/yt-websub/channels.txt
 # Add your channel ids / @handles / URLs.
 ```
-
-Ensure the service user can read the cert (LE keys are `root:root 0600` by default). Simplest:
-grant the private-key dirs to a group the service user is in, or have the deploy-hook copy
-`fullchain.pem`/`privkey.pem` into `/var/lib/yt-websub/` readable by `yt-websub` and point
-`YTWEBSUB_TLS_*` there.
 
 ### 3. systemd
 
@@ -97,12 +109,32 @@ systemctl enable --now yt-websub
 journalctl -u yt-websub -f
 ```
 
-### 4. Firewall
+### 4. Auto-renewal hook
+
+Now that the service exists, wire up cert refresh on renewal. Create
+`/etc/letsencrypt/renewal-hooks/deploy/yt-websub.sh` (`chmod +x`):
 
 ```sh
-ufw allow 443/tcp      # callback + /api
-ufw allow 80/tcp       # only if using certbot HTTP-01 renewal
-# Optional: restrict :443 source to your home IP for extra /api safety.
+#!/bin/sh
+install -o yt-websub -g yt-websub -m 0644 \
+  /etc/letsencrypt/live/hooks.example.com/fullchain.pem /var/lib/yt-websub/cert.pem
+install -o yt-websub -g yt-websub -m 0600 \
+  /etc/letsencrypt/live/hooks.example.com/privkey.pem  /var/lib/yt-websub/key.pem
+systemctl restart yt-websub || true
+```
+
+certbot runs this after each successful renewal — refreshing the copies and reloading the cert
+(restart is cheap; subscriptions reload from disk). Test it with `certbot renew --dry-run` (the hook
+won't run on a dry-run, but it confirms renewal works), or run the script by hand once.
+
+### 5. Firewall
+
+```sh
+ufw default deny incoming
+ufw allow 443/tcp      # callback + /api — the only inbound port needed
+ufw enable
+# DNS-01 means port 80 stays closed. Optional: restrict :443 source to your
+# home IP for extra /api safety.
 ```
 
 ## Managing channels
@@ -123,6 +155,7 @@ All `/api/*` routes require `Authorization: Bearer <YTWEBSUB_BEARER_TOKEN>`.
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
 | GET | `/api/health` | – | `{"ok":true,"subs_active":k,"max_seq":N,"now":t}` |
+| GET | `/api/channels` | – | `{"channels":[{"channel_id":"UC..","state":"active","lease_seconds":L,"expires_at":t,"fail_count":0,"topic":"…"}],"count":k}` |
 | GET | `/api/events` | `?after=<seq>&max=<n≤2000>` | `{"events":[…],"max_seq":N}` |
 | POST | `/api/channels` | `{"channels":["UC..","@handle",…]}` | `{"subscribed":n,"unsubscribed":m,"active":k}` |
 | POST | `/api/ack` | `{"through":<seq>}` | `{"ok":true}` (advances compaction horizon) |
