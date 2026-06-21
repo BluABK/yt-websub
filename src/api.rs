@@ -87,6 +87,32 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
             json_response(req, 200, out);
         }
 
+        (Method::Get, "/api/channels") => {
+            let mut subs: Vec<crate::subs::Sub> = {
+                let reg = app.subs.lock().unwrap();
+                reg.subs.values().cloned().collect()
+            };
+            subs.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+            let mut out = String::from("{\"channels\":[");
+            for (i, s) in subs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // Note: secret/token are intentionally NOT exposed.
+                out.push_str(&format!(
+                    "{{\"channel_id\":{},\"state\":{},\"lease_seconds\":{},\"expires_at\":{},\"fail_count\":{},\"topic\":{}}}",
+                    json_string(&s.channel_id),
+                    json_string(&s.state),
+                    s.lease_seconds,
+                    s.expires_at,
+                    s.fail_count,
+                    json_string(&s.topic)
+                ));
+            }
+            out.push_str(&format!("],\"count\":{}}}", subs.len()));
+            json_response(req, 200, out);
+        }
+
         (Method::Post, "/api/ack") => {
             let body = read_body(&mut req);
             let through = extract_u64(&body, "through").unwrap_or(0);
