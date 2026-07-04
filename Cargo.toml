@@ -18,6 +18,15 @@ sha1 = "0.10"
 # OS RNG for per-subscription secrets/tokens (cross-platform).
 getrandom = "0.2"
 
+# Vendored tiny_http with a local DoS fix: upstream's EqualReader::drop
+# allocates the full remaining Content-Length in one Vec, so one request
+# claiming a huge body ("Content-Length: 18446744073709551615") panics with
+# "capacity overflow" — which panic=abort escalates to killing the process.
+# Unfixed upstream as of 2026-07 (master still allocates unbounded).
+# See vendor/tiny_http/src/util/equal_reader.rs and tests/huge_content_length.rs.
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
+
 [profile.release]
 opt-level = "z"
 lto = true
