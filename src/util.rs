@@ -1,7 +1,23 @@
 //! Small dependency-free helpers: time, hex, OS randomness, percent-encoding
 //! (for TSV-safe storage), JSON string escaping, and query parsing.
 
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Write `bytes` to `path` durably and atomically: write a temp file, fsync its
+/// data, then rename over the target. A crash/power-loss leaves either the old
+/// file or the complete new one, never a torn or empty file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_data()?;
+    }
+    fs::rename(&tmp, path)
+}
 
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -131,8 +147,12 @@ pub fn query_get(query: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Constant-time byte-equality, so comparing the bearer token doesn't leak its
-/// length/contents through timing. (HMAC verification already uses a CT compare.)
+/// Constant-time equality for equal-length inputs: the byte comparison is
+/// branch-free, so it does not leak *which* bytes (or how many) of the bearer
+/// token differ. It DOES return early on a length mismatch, so the *length* of
+/// the expected value is not hidden — acceptable here because the bearer token is
+/// a fixed, high-entropy secret whose length is not sensitive. (HMAC verification
+/// uses its own constant-time compare via `verify_slice`.)
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

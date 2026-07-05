@@ -5,7 +5,17 @@ use std::os::unix::net as unix_net;
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
+    time::Duration,
 };
+
+/// LOCAL PATCH (yt-websub): per-socket read/write timeout applied to every
+/// accepted TCP connection. A single blocking read/write that makes no progress
+/// within this window fails (WouldBlock/TimedOut), which drops the connection.
+/// Without it, an unauthenticated slowloris client that opens a socket and never
+/// finishes the request head pins its connection thread forever (and, via the
+/// TaskPool, forces unbounded thread spawns). 30s is generous for a legitimate
+/// hub POST or API poll while reaping stalled peers promptly.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Unified listener. Either a [`TcpListener`] or [`std::os::unix::net::UnixListener`]
 pub enum Listener {
@@ -24,9 +34,15 @@ impl Listener {
 
     pub(crate) fn accept(&self) -> std::io::Result<(Connection, Option<SocketAddr>)> {
         match self {
-            Self::Tcp(l) => l
-                .accept()
-                .map(|(conn, addr)| (Connection::from(conn), Some(addr))),
+            Self::Tcp(l) => l.accept().map(|(conn, addr)| {
+                // LOCAL PATCH (yt-websub): bound how long any single socket
+                // read/write may block, so a stalled client cannot pin a
+                // connection thread indefinitely. Best-effort; a failure here
+                // only means this one socket keeps the OS default.
+                let _ = conn.set_read_timeout(Some(SOCKET_TIMEOUT));
+                let _ = conn.set_write_timeout(Some(SOCKET_TIMEOUT));
+                (Connection::from(conn), Some(addr))
+            }),
             #[cfg(unix)]
             Self::Unix(l) => l.accept().map(|(conn, _)| (Connection::from(conn), None)),
         }

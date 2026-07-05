@@ -29,6 +29,18 @@ struct Sharing {
 /// Minimum number of active threads.
 static MIN_THREADS: usize = 4;
 
+/// LOCAL PATCH (yt-websub): maximum number of worker threads. Upstream had no
+/// ceiling — it spawned a fresh OS thread for every connection whenever no
+/// worker was idle, using a panicking `std::thread::spawn`. A flood of stalled
+/// connections thus climbed until the process/pid limit (systemd `TasksMax=32`)
+/// and the next spawn PANICKED, which `panic=abort` escalated to a whole-process
+/// SIGABRT. We now cap the pool below `TasksMax` (leaving headroom for the app's
+/// own accept workers, the renewal thread, and libc); beyond the cap, tasks
+/// queue until a worker frees. Socket read timeouts (see connection.rs) reap
+/// stalled connections so the pool drains. Paired with a non-panicking spawn
+/// below, hitting a resource ceiling drops one connection instead of the server.
+static MAX_THREADS: usize = 20;
+
 struct Registration<'a> {
     nb: &'a AtomicUsize,
 }
@@ -69,7 +81,14 @@ impl TaskPool {
     pub fn spawn(&self, code: Box<dyn FnMut() + Send>) {
         let mut queue = self.sharing.todo.lock().unwrap();
 
-        if self.sharing.waiting_tasks.load(Ordering::Acquire) == 0 {
+        // LOCAL PATCH (yt-websub): only spawn a new worker if none is idle AND we
+        // are below the thread ceiling; otherwise queue the task for an existing
+        // worker. `active_tasks` is incremented inside the worker so it can lag
+        // slightly under a burst, but the non-panicking add_thread makes any
+        // overshoot harmless rather than fatal.
+        if self.sharing.waiting_tasks.load(Ordering::Acquire) == 0
+            && self.sharing.active_tasks.load(Ordering::Acquire) < MAX_THREADS
+        {
             self.add_thread(Some(code));
         } else {
             queue.push_back(code);
@@ -80,7 +99,12 @@ impl TaskPool {
     fn add_thread(&self, initial_fn: Option<Box<dyn FnMut() + Send>>) {
         let sharing = self.sharing.clone();
 
-        thread::spawn(move || {
+        // LOCAL PATCH (yt-websub): use a fallible Builder::spawn instead of the
+        // panicking thread::spawn. If the OS refuses a new thread (e.g. the
+        // systemd TasksMax pid ceiling under a connection flood), we log and drop
+        // the closure — which closes that one pending connection — instead of
+        // panicking and (under panic=abort) killing the entire process.
+        let spawn_result = thread::Builder::new().spawn(move || {
             let sharing = sharing;
             let _active_guard = Registration::new(&sharing.active_tasks);
 
@@ -124,6 +148,10 @@ impl TaskPool {
                 task();
             }
         });
+
+        if let Err(e) = spawn_result {
+            log::error!("TaskPool: OS refused a new worker thread: {}", e);
+        }
     }
 }
 

@@ -33,6 +33,13 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&") // must be last
 }
 
+/// A YouTube video id: exactly 11 chars from the URL-safe base64 alphabet.
+fn is_video_id(s: &str) -> bool {
+    s.len() == 11
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Find a 24-char `UC...` channel id following any of the known markers.
 fn find_channel_id(s: &str) -> Option<String> {
     for marker in ["<yt:channelId>UC", "/channel/UC", "channel_id=UC"] {
@@ -65,9 +72,11 @@ pub fn parse(body: &str) -> Vec<Entry> {
             .unwrap_or(rest.len());
         let block = &rest[block_start..block_end];
         let video_id = between(block, "ref=\"yt:video:", "\"")
-            .map(|s| s.to_string())
+            .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        if !video_id.is_empty() {
+        // Only emit for a well-formed video id; this rejects any tab/newline or
+        // other garbage a malformed/hostile relay might smuggle into the ref.
+        if is_video_id(&video_id) {
             out.push(Entry {
                 kind: "deleted".to_string(),
                 channel_id: find_channel_id(block).unwrap_or_default(),
@@ -90,11 +99,18 @@ pub fn parse(body: &str) -> Vec<Entry> {
         let block = &rest[block_start..block_end];
 
         let video_id = tag(block, "videoId").map(|s| s.trim().to_string());
+        // Prefer a shape-validated channel id; the primary tag() value is NOT
+        // validated by tag() itself, so fall back to the strict scanner if it is
+        // not a well-formed UC id.
         let channel_id = tag(block, "channelId")
             .map(|s| s.trim().to_string())
+            .filter(|c| crate::resolve::is_channel_id(c))
             .or_else(|| find_channel_id(block));
         if let (Some(video_id), Some(channel_id)) = (video_id, channel_id) {
-            if !video_id.is_empty() && !channel_id.is_empty() {
+            // Both fields must be well-formed to be stored (defense-in-depth against
+            // a malformed/hostile signed feed; storage encoding already prevents
+            // TSV corruption, this prevents garbage attribution).
+            if is_video_id(&video_id) && crate::resolve::is_channel_id(&channel_id) {
                 let title = tag(block, "title")
                     .map(|s| decode_entities(s.trim()))
                     .unwrap_or_default();
@@ -183,5 +199,23 @@ mod tests {
     fn ignores_garbage() {
         assert!(parse("not xml at all").is_empty());
         assert!(parse("<entry><title>no ids</title></entry>").is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_ids() {
+        // Deleted-entry ref carrying a tab is not a valid 11-char video id.
+        assert!(parse("<at:deleted-entry ref=\"yt:video:bad\tid\"></at:deleted-entry>").is_empty());
+        // Over-long video id in a regular entry is dropped.
+        assert!(parse(
+            "<entry><yt:videoId>waytoolongvideoid</yt:videoId>\
+             <yt:channelId>UCabcdefghijklmnopqrstuv</yt:channelId></entry>"
+        )
+        .is_empty());
+        // Malformed channel id (not UC + 24) is dropped.
+        assert!(parse(
+            "<entry><yt:videoId>abc123XYZ_-</yt:videoId>\
+             <yt:channelId>not-a-channel</yt:channelId></entry>"
+        )
+        .is_empty());
     }
 }

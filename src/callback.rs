@@ -45,6 +45,10 @@ fn handle_verify(app: &App, req: Request, sub: &crate::subs::Sub, query: &str) {
     let vtoken = query_get(query, "hub.verify_token").unwrap_or_default();
 
     // Reject anything that doesn't match the subscription we actually requested.
+    // NOTE: hub.verify_token is NOT an independent second factor — we hand the hub
+    // the callback path token itself as verify_token (see hub::send), so this check
+    // adds nothing beyond the unguessable path token that already gated the route.
+    // The real trust boundary here is the 128-bit path token.
     if topic != sub.topic
         || challenge.is_empty()
         || (!vtoken.is_empty() && vtoken != sub.token)
@@ -54,14 +58,19 @@ fn handle_verify(app: &App, req: Request, sub: &crate::subs::Sub, query: &str) {
     }
 
     if mode == "subscribe" {
-        let lease = query_get(query, "hub.lease_seconds")
-            .and_then(|s| s.parse().ok())
+        let requested = query_get(query, "hub.lease_seconds")
+            .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(app.cfg.lease_seconds);
+        // Never trust a lease longer than we asked for. Otherwise a token holder
+        // could pin the sub 'active' with a far-future expiry so the renew loop
+        // never re-subscribes, while the hub's real lease lapses — silently
+        // stopping notifications while /api/health still shows "active".
+        let lease = requested.min(app.cfg.lease_seconds.max(1));
         let mut reg = app.subs.lock().unwrap();
         if let Some(mut s) = reg.subs.get(&sub.channel_id).cloned() {
             s.state = "active".to_string();
             s.lease_seconds = lease;
-            s.expires_at = now_unix() + lease;
+            s.expires_at = now_unix().saturating_add(lease);
             s.fail_count = 0;
             s.next_attempt_at = 0;
             reg.update(s);
@@ -109,7 +118,16 @@ fn handle_notify(app: &App, mut req: Request, sub: &crate::subs::Sub) {
     {
         let mut store = app.store.lock().unwrap();
         for e in &entries {
-            match store.append(&e.kind, &e.channel_id, &e.video_id, &e.ts, &e.title) {
+            // Attribute the event to the subscription it authenticated on, not to
+            // whatever channel_id the (signed but possibly hostile) body claims —
+            // a WebSub feed is per-topic, so sub.channel_id is authoritative.
+            if !e.channel_id.is_empty() && e.channel_id != sub.channel_id {
+                eprintln!(
+                    "[callback] body channel_id {} != subscription {}; attributing to subscription",
+                    e.channel_id, sub.channel_id
+                );
+            }
+            match store.append(&e.kind, &sub.channel_id, &e.video_id, &e.ts, &e.title) {
                 Ok(Some(seq)) => eprintln!(
                     "[event] seq={} kind={} channel={} video={} title={:?}",
                     seq, e.kind, e.channel_id, e.video_id, e.title

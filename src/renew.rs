@@ -24,13 +24,22 @@ fn backoff(fail_count: u32) -> u64 {
     (30 * factor).min(1800) // 30s .. 30m
 }
 
-fn channels_mtime(app: &App) -> u64 {
-    fs::metadata(&app.cfg.channels_file)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Change signature of channels.txt: (mtime_secs, len). Including the length as
+/// well as the second-granularity mtime avoids missing a same-second edit that
+/// changes the file size (which nearly every real edit does).
+fn channels_sig(app: &App) -> (u64, u64) {
+    match fs::metadata(&app.cfg.channels_file) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (mtime, m.len())
+        }
+        Err(_) => (0, 0),
+    }
 }
 
 fn save_cache(dir: &str, cache: &HashMap<String, String>) {
@@ -49,8 +58,23 @@ fn save_cache(dir: &str, cache: &HashMap<String, String>) {
 /// the caller must NOT treat the set as authoritative for removals (a transient
 /// resolution failure must never unsubscribe a healthy channel).
 fn desired_set(app: &App) -> (Vec<String>, bool) {
-    let content = fs::read_to_string(&app.cfg.channels_file).unwrap_or_default();
-    let mut cache = app.resolve_cache.lock().unwrap();
+    // A missing/unreadable channels file must NOT be treated as "zero desired
+    // channels" — that would make reconcile unsubscribe everything. Treat it as
+    // incomplete (skip removals) instead.
+    let content = match fs::read_to_string(&app.cfg.channels_file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[reconcile] cannot read channels file {}: {}; skipping removals this cycle",
+                app.cfg.channels_file, e
+            );
+            return (Vec::new(), false);
+        }
+    };
+
+    // Resolve against a snapshot of the cache so we hold no lock across network
+    // I/O (per the app-wide no-network-under-lock invariant), then merge back.
+    let mut cache = app.resolve_cache.lock().unwrap().clone();
     let mut out: Vec<String> = Vec::new();
     let mut complete = true;
     for line in content.lines() {
@@ -67,7 +91,13 @@ fn desired_set(app: &App) -> (Vec<String>, bool) {
             }
         }
     }
-    save_cache(&app.cfg.storage_dir, &cache);
+    {
+        let mut live = app.resolve_cache.lock().unwrap();
+        for (k, v) in &cache {
+            live.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        save_cache(&app.cfg.storage_dir, &live);
+    }
     (out, complete)
 }
 
@@ -76,6 +106,42 @@ fn desired_set(app: &App) -> (Vec<String>, bool) {
 pub fn reconcile(app: &App) -> (usize, usize, usize) {
     // Serialize whole reconciles so API-driven and timer-driven runs don't race.
     let _guard = app.reconcile_lock.lock().unwrap();
+    reconcile_locked(app)
+}
+
+/// Like `reconcile`, but returns `None` immediately if another reconcile is
+/// already running rather than blocking. The API handler uses this so a POST
+/// cannot pin an HTTP worker for the duration of another reconcile's network I/O.
+pub fn try_reconcile(app: &App) -> Option<(usize, usize, usize)> {
+    match app.reconcile_lock.try_lock() {
+        Ok(_guard) => Some(reconcile_locked(app)),
+        Err(_) => None,
+    }
+}
+
+/// Write back the outcome of a (re)subscribe attempt, but only if the stored sub
+/// is still the same one (same token — a concurrent reconcile may have replaced
+/// it) and without clobbering an activation/expiry a verify GET landed while we
+/// were sending.
+fn merge_attempt(app: &App, mut s: subs::Sub) {
+    let mut reg = app.subs.lock().unwrap();
+    if let Some(cur) = reg.subs.get(&s.channel_id) {
+        if cur.token != s.token {
+            return; // replaced concurrently; drop our stale write
+        }
+        if cur.state == "active" {
+            // A verify GET already (re)activated it — keep that state and its
+            // fresher expiry, don't revert to our pre-send snapshot.
+            s.state = "active".to_string();
+            s.expires_at = cur.expires_at;
+            s.lease_seconds = cur.lease_seconds;
+        }
+        reg.update(s);
+        let _ = reg.save();
+    }
+}
+
+fn reconcile_locked(app: &App) -> (usize, usize, usize) {
     let (desired, complete) = desired_set(app);
 
     let (to_add, to_remove): (Vec<String>, Vec<subs::Sub>) = {
@@ -104,25 +170,31 @@ pub fn reconcile(app: &App) -> (usize, usize, usize) {
     for cid in &to_add {
         let mut s = subs::Sub::new(cid);
         s.last_subscribe_at = now_unix();
+        // Register the token BEFORE contacting the hub so a fast async verify GET
+        // (which carries this token) resolves instead of 404ing. The lock is held
+        // only for the map insert, never across the network call below.
+        app.subs.lock().unwrap().insert(s.clone());
         match hub::send(&app.cfg, &s, "subscribe") {
             Ok(code) if hub::is_ok(code) => {
                 subscribed += 1;
                 eprintln!("[reconcile] subscribe {} -> {} (pending verify)", cid, code);
+                // Leave it pending; the verify GET will activate it.
             }
             Ok(code) => {
                 eprintln!("[reconcile] subscribe {} -> HTTP {}", cid, code);
                 s.state = "failed".into();
                 s.fail_count = 1;
                 s.next_attempt_at = now_unix() + backoff(1);
+                merge_attempt(app, s);
             }
             Err(e) => {
                 eprintln!("[reconcile] subscribe {} error: {}", cid, e);
                 s.state = "failed".into();
                 s.fail_count = 1;
                 s.next_attempt_at = now_unix() + backoff(1);
+                merge_attempt(app, s);
             }
         }
-        app.subs.lock().unwrap().insert(s);
     }
 
     let mut unsubscribed = 0;
@@ -194,26 +266,23 @@ fn renew_due(app: &App) {
                 s.next_attempt_at = now_unix() + backoff(s.fail_count);
             }
         }
-        let mut reg = app.subs.lock().unwrap();
-        // Skip if a concurrent reconcile removed it.
-        if reg.subs.contains_key(&s.channel_id) {
-            reg.update(s);
-            let _ = reg.save();
-        }
+        // Merge the outcome without clobbering a concurrent verify/replacement
+        // (also skips if a reconcile removed the sub or swapped its token).
+        merge_attempt(app, s);
     }
 }
 
 pub fn run(app: Arc<App>) {
     reconcile(&app);
-    let mut last_mtime = channels_mtime(&app);
+    let mut last_sig = channels_sig(&app);
     let mut ticks = 0u64;
     loop {
         thread::sleep(Duration::from_secs(RENEW_TICK));
         ticks += 1;
 
-        let m = channels_mtime(&app);
-        if m != last_mtime {
-            last_mtime = m;
+        let sig = channels_sig(&app);
+        if sig != last_sig {
+            last_sig = sig;
             eprintln!("[reconcile] channels file changed; reconciling");
             reconcile(&app);
         }

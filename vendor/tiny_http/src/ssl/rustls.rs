@@ -80,17 +80,37 @@ impl RustlsContext {
         }
 
         let private_key = rustls::PrivateKey({
-            let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(
-                &mut private_key.clone().as_slice(),
-            )
-            .expect("file contains invalid pkcs8 private key (encrypted keys are not supported)");
+            // LOCAL PATCH (yt-websub): upstream `.expect()`d on the pemfile parse
+            // and indexed `rsa_keys[0]` unconditionally, so a valid-but-unsupported
+            // or empty/garbled key file PANICKED. Under panic=abort that aborts at
+            // startup, bypassing main.rs's graceful exit(2) and flapping under
+            // systemd Restart. Now we try PKCS#8, then PKCS#1 (RSA), and return a
+            // descriptive error the caller surfaces instead of aborting.
+            //
+            // NOTE: this pinned rustls-pemfile 0.2.1 cannot parse a bare SEC1
+            // "BEGIN EC PRIVATE KEY" file. certbot/Let's Encrypt already emit
+            // PKCS#8 for both RSA and ECDSA, so this only affects hand-generated
+            // SEC1 keys (`openssl ecparam -genkey`); convert one with
+            // `openssl pkcs8 -topk8 -nocrypt -in ec.pem -out ec.pk8.pem`.
+            let der = rustls_pemfile::pkcs8_private_keys(&mut private_key.clone().as_slice())
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .or_else(|| {
+                    rustls_pemfile::rsa_private_keys(&mut private_key.as_slice())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                });
 
-            if let Some(pkcs8_key) = pkcs8_keys.first() {
-                pkcs8_key.clone()
-            } else {
-                let rsa_keys = rustls_pemfile::rsa_private_keys(&mut private_key.as_slice())
-                    .expect("file contains invalid rsa private key");
-                rsa_keys[0].clone()
+            match der {
+                Some(der) => der,
+                None => {
+                    return Err("no supported private key found in key file (expected an \
+                                unencrypted PKCS#8 or PKCS#1/RSA PEM key; convert a SEC1/EC \
+                                key with `openssl pkcs8 -topk8 -nocrypt`)"
+                        .into())
+                }
             }
         });
 

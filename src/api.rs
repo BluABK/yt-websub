@@ -122,11 +122,23 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
 
         (Method::Post, "/api/channels") => {
             let body = read_body(&mut req);
-            let channels = extract_string_array(&body);
+            // Drop any entry containing an ASCII control character (tab/newline/etc.)
+            // so a caller can't inject extra lines into channels.txt (which would
+            // persist verbatim across future rewrites) or corrupt resolve.cache.
+            let channels: Vec<String> = extract_string_array(&body)
+                .into_iter()
+                .filter(|c| is_safe_channel_entry(c))
+                .collect();
             // Persist to the channels file (single source of truth) then
             // reconcile, preserving any operator comment/blank lines.
             let content = render_channels_file(&app.cfg.channels_file, &channels);
-            if let Err(e) = std::fs::write(&app.cfg.channels_file, content) {
+            // Atomic write (tmp + fsync + rename): a crash or overlapping write must
+            // never leave channels.txt empty, which a reconcile would read as "no
+            // desired channels" and use to mass-unsubscribe everything.
+            if let Err(e) = crate::util::write_atomic(
+                std::path::Path::new(&app.cfg.channels_file),
+                content.as_bytes(),
+            ) {
                 json_response(
                     req,
                     500,
@@ -134,15 +146,25 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
                 );
                 return;
             }
-            let (subscribed, unsubscribed, active) = crate::renew::reconcile(app);
-            json_response(
-                req,
-                200,
-                format!(
-                    "{{\"subscribed\":{},\"unsubscribed\":{},\"active\":{}}}",
-                    subscribed, unsubscribed, active
+            // Reconcile now if no other reconcile is running; otherwise the change is
+            // already durably persisted and the renew loop will pick it up (it detects
+            // the mtime/size change), so we don't block this worker on the lock.
+            match crate::renew::try_reconcile(app) {
+                Some((subscribed, unsubscribed, active)) => json_response(
+                    req,
+                    200,
+                    format!(
+                        "{{\"subscribed\":{},\"unsubscribed\":{},\"active\":{}}}",
+                        subscribed, unsubscribed, active
+                    ),
                 ),
-            );
+                None => json_response(
+                    req,
+                    202,
+                    "{\"status\":\"accepted\",\"note\":\"reconcile already running; change will be applied shortly\"}"
+                        .to_string(),
+                ),
+            }
         }
 
         _ => json_response(req, 404, "{\"error\":\"not found\"}".to_string()),
@@ -174,6 +196,12 @@ fn render_channels_file(path: &str, channels: &[String]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// A channel entry is safe to persist to channels.txt only if it contains no
+/// ASCII control characters (which could inject lines or corrupt TSV framing).
+fn is_safe_channel_entry(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
 fn extract_u64(text: &str, key: &str) -> Option<u64> {
@@ -252,6 +280,17 @@ mod tests {
         assert_eq!(extract_u64(r#"{"through": 42}"#, "through"), Some(42));
         assert_eq!(extract_u64(r#"{"through":7,"x":1}"#, "through"), Some(7));
         assert_eq!(extract_u64(r#"{"x":1}"#, "through"), None);
+    }
+
+    #[test]
+    fn rejects_control_chars_in_channel_entries() {
+        assert!(is_safe_channel_entry("UCabcdefghijklmnopqrstuv"));
+        assert!(is_safe_channel_entry("@handle"));
+        assert!(is_safe_channel_entry("https://www.youtube.com/@x"));
+        assert!(!is_safe_channel_entry("has\ttab"));
+        assert!(!is_safe_channel_entry("has\nnewline"));
+        assert!(!is_safe_channel_entry("has\x7fdel"));
+        assert!(!is_safe_channel_entry(""));
     }
 
     #[test]

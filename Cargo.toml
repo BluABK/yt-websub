@@ -18,12 +18,16 @@ sha1 = "0.10"
 # OS RNG for per-subscription secrets/tokens (cross-platform).
 getrandom = "0.2"
 
-# Vendored tiny_http with a local DoS fix: upstream's EqualReader::drop
-# allocates the full remaining Content-Length in one Vec, so one request
-# claiming a huge body ("Content-Length: 18446744073709551615") panics with
-# "capacity overflow" — which panic=abort escalates to killing the process.
-# Unfixed upstream as of 2026-07 (master still allocates unbounded).
-# See vendor/tiny_http/src/util/equal_reader.rs and tests/huge_content_length.rs.
+# Vendored tiny_http with several local hardening patches for an internet-exposed
+# listener (all marked "LOCAL PATCH (yt-websub)"), none fixed upstream as of 2026-07:
+#   - equal_reader.rs: bound the unread-body drain (was: alloc full Content-Length
+#     -> "capacity overflow" panic -> abort). See tests/huge_content_length.rs.
+#   - client.rs: cap request/header line length + header count (was: unbounded
+#     buffering -> OOM). See tests/oversized_headers.rs.
+#   - connection.rs: per-socket read/write timeouts (was: none -> slowloris).
+#   - util/task_pool.rs: bounded, non-panicking worker spawn (was: unbounded
+#     thread::spawn -> panic/abort at the TasksMax pid ceiling).
+#   - ssl/rustls.rs: non-panicking private-key loader (was: expect()/index panic).
 [patch.crates-io]
 tiny_http = { path = "vendor/tiny_http" }
 
@@ -32,4 +36,13 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+# panic=abort is load-bearing: the code uses `.lock().unwrap()` throughout and
+# relies on the first panic aborting the process (systemd restarts it) rather than
+# poisoning a mutex and cascading. See the note in src/app.rs.
+panic = "abort"
+
+[profile.dev]
+# Match release poisoning semantics so a debug run of the server fails the same,
+# systemd-restartable way instead of poison-cascading its mutexes. (cargo forces
+# unwind for the test profile automatically, so `cargo test` is unaffected.)
 panic = "abort"

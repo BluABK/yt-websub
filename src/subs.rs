@@ -4,10 +4,25 @@
 //! subscription — and thus which secret to verify against — purely from its URL.
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::util::rand_hex;
+
+/// Create/truncate `path` for writing, owner-only (0600) on Unix. subs.tsv holds
+/// per-subscription HMAC secrets and callback tokens in cleartext, so it must not
+/// be world-readable regardless of the process umask.
+fn create_private(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
 
 #[derive(Clone, Debug)]
 pub struct Sub {
@@ -113,7 +128,14 @@ impl Registry {
         for s in self.subs.values() {
             out.push_str(&fmt_line(s));
         }
-        fs::write(&tmp, out.as_bytes())?;
+        // Write + fsync + atomic rename so a crash/power-loss can't leave subs.tsv
+        // torn or empty (which would drop every subscription on reload). Create it
+        // 0600 since it stores secrets.
+        {
+            let mut f = create_private(&tmp)?;
+            f.write_all(out.as_bytes())?;
+            f.sync_data()?;
+        }
         fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -132,6 +154,13 @@ impl Registry {
 
     /// Replace a sub (keyed by channel_id), keeping the token index consistent.
     pub fn update(&mut self, s: Sub) {
+        // If this channel previously had a different token, drop the stale
+        // token→channel index entry so a superseded token can't still resolve.
+        if let Some(old) = self.subs.get(&s.channel_id) {
+            if old.token != s.token {
+                self.by_token.remove(&old.token);
+            }
+        }
         self.by_token.insert(s.token.clone(), s.channel_id.clone());
         self.subs.insert(s.channel_id.clone(), s);
     }

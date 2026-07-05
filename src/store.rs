@@ -6,14 +6,18 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::util::{now_unix, pct_decode, pct_encode};
+use crate::util::{now_unix, pct_decode, pct_encode, write_atomic};
 
 const RECENT_CAP: usize = 2000;
 const COMPACT_BYTES: u64 = 8 * 1024 * 1024;
 const COMPACT_MARGIN: u64 = 1000;
+/// Ack-independent retention floor: even if the consumer never advances the ack
+/// cursor, compaction drops events older than this many below `max_seq`, so the
+/// log cannot grow without bound and OOM the process under `MemoryMax`.
+const MAX_RETAINED_EVENTS: u64 = 100_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
@@ -41,14 +45,20 @@ fn dedup_key(video_id: &str, ts: &str, kind: &str) -> String {
 }
 
 fn format_line(e: &Event) -> String {
+    // Percent-encode EVERY string field, not just the title. pct_encode escapes
+    // all control bytes (including TAB and newline) and '%', so no field can ever
+    // contain a TAB or newline — otherwise a crafted channel_id/video_id/ts in a
+    // signed-but-malformed notification could split a row (forging an event) or
+    // add a stray field (silently dropping the event on reload). seq/received_at
+    // are numeric and need no encoding.
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         e.seq,
         e.received_at,
-        e.kind,
-        e.channel_id,
-        e.video_id,
-        e.ts,
+        pct_encode(&e.kind),
+        pct_encode(&e.channel_id),
+        pct_encode(&e.video_id),
+        pct_encode(&e.ts),
         pct_encode(&e.title)
     )
 }
@@ -58,13 +68,15 @@ fn parse_line(line: &str) -> Option<Event> {
     if p.len() != 7 {
         return None;
     }
+    // pct_decode is identity for legacy raw fields (which never contained '%'),
+    // so this stays backward-compatible with logs written before all-field encoding.
     Some(Event {
         seq: p[0].parse().ok()?,
         received_at: p[1].parse().ok()?,
-        kind: p[2].to_string(),
-        channel_id: p[3].to_string(),
-        video_id: p[4].to_string(),
-        ts: p[5].to_string(),
+        kind: pct_decode(p[2]),
+        channel_id: pct_decode(p[3]),
+        video_id: pct_decode(p[4]),
+        ts: pct_decode(p[5]),
         title: pct_decode(p[6]),
     })
 }
@@ -77,11 +89,18 @@ impl Store {
 
         let mut next_seq = 1u64;
         let mut recent: VecDeque<Event> = VecDeque::new();
-        if let Ok(content) = fs::read_to_string(&events_path) {
-            for line in content.lines() {
-                if let Some(e) = parse_line(line) {
+        // Stream the log line-by-line rather than reading the whole file into one
+        // String: an unbounded log (consumer stopped acking) must not OOM the
+        // process on startup under MemoryMax.
+        if let Ok(f) = File::open(&events_path) {
+            for line in BufReader::new(f).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break, // torn final line / read error: stop
+                };
+                if let Some(e) = parse_line(&line) {
                     if e.seq >= next_seq {
-                        next_seq = e.seq + 1;
+                        next_seq = e.seq.saturating_add(1); // never wrap on a forged/huge seq
                     }
                     recent.push_back(e);
                     if recent.len() > RECENT_CAP {
@@ -168,9 +187,14 @@ impl Store {
                 .collect();
         }
         let mut out = Vec::new();
-        if let Ok(content) = fs::read_to_string(&self.events_path) {
-            for line in content.lines() {
-                if let Some(e) = parse_line(line) {
+        // Stream rather than slurp the whole (possibly large) log into memory.
+        if let Ok(f) = File::open(&self.events_path) {
+            for line in BufReader::new(f).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if let Some(e) = parse_line(&line) {
                     if e.seq > after {
                         out.push(e);
                         if out.len() >= max {
@@ -186,7 +210,11 @@ impl Store {
     pub fn set_ack(&mut self, through: u64) {
         if through > self.ack_through {
             self.ack_through = through;
-            let _ = fs::write(&self.ack_path, self.ack_through.to_string());
+            // Durable, atomic rewrite so a torn write can't regress the ack
+            // cursor (which would stall compaction) — and surface errors.
+            if let Err(e) = write_atomic(&self.ack_path, self.ack_through.to_string().as_bytes()) {
+                eprintln!("[store] failed to persist ack cursor: {}", e);
+            }
         }
     }
 
@@ -198,21 +226,40 @@ impl Store {
         if len < COMPACT_BYTES {
             return Ok(());
         }
-        let keep_above = self.ack_through.saturating_sub(COMPACT_MARGIN);
-        let content = fs::read_to_string(&self.events_path)?;
+        // Drop events at/below the acked horizon (minus a margin) AND enforce an
+        // ack-independent retention floor, so a stalled ack cursor cannot let the
+        // log grow without bound.
+        let ack_floor = self.ack_through.saturating_sub(COMPACT_MARGIN);
+        let seq_floor = self.max_seq().saturating_sub(MAX_RETAINED_EVENTS);
+        let keep_above = ack_floor.max(seq_floor);
+
         let tmp = self.events_path.with_extension("log.tmp");
+        let mut dropped: u64 = 0;
         {
+            let reader = BufReader::new(File::open(&self.events_path)?);
             let mut w = BufWriter::new(File::create(&tmp)?);
-            for line in content.lines() {
-                if let Some(e) = parse_line(line) {
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if let Some(e) = parse_line(&line) {
                     if e.seq > keep_above {
                         w.write_all(line.as_bytes())?;
                         w.write_all(b"\n")?;
+                    } else {
+                        dropped += 1;
                     }
                 }
             }
             w.flush()?;
             w.get_ref().sync_data()?;
+        }
+        // Nothing was reclaimable: don't rewrite the whole (large) file every hour
+        // for zero progress — just discard the temp copy.
+        if dropped == 0 {
+            let _ = fs::remove_file(&tmp);
+            return Ok(());
         }
         fs::rename(&tmp, &self.events_path)?;
         self.log = OpenOptions::new()
@@ -272,6 +319,53 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.max_seq(), 2); // torn line ignored
         assert_eq!(s.events_after(0, 100).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fields_with_tabs_and_newlines_do_not_corrupt_the_log() {
+        let dir = temp_dir("store_inject");
+        let mut s = Store::open(&dir).unwrap();
+        // Tabs/newlines in the (normally structured) fields must be encoded, so
+        // the row can't split or gain/lose a column.
+        let seq = s
+            .append("new", "UC1", "vid\twith\ttab", "ts\nwith\nnl", "ti\ttle\n")
+            .unwrap();
+        assert_eq!(seq, Some(1));
+        let e = &s.events_after(0, 10)[0];
+        assert_eq!(e.video_id, "vid\twith\ttab");
+        assert_eq!(e.ts, "ts\nwith\nnl");
+        drop(s);
+
+        // Survives a reload intact: exactly one event, no split/dropped line.
+        let s2 = Store::open(&dir).unwrap();
+        assert_eq!(s2.max_seq(), 1);
+        let e2 = &s2.events_after(0, 10)[0];
+        assert_eq!(e2.video_id, "vid\twith\ttab");
+        assert_eq!(e2.ts, "ts\nwith\nnl");
+        assert_eq!(e2.title, "ti\ttle\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_does_not_wrap_next_seq_to_zero_on_forged_huge_seq() {
+        let dir = temp_dir("store_seqwrap");
+        {
+            let _ = Store::open(&dir).unwrap();
+        }
+        // Hand-write a line with seq = u64::MAX (as a corrupted/hostile log would).
+        use std::io::Write as _;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.join("events.log"))
+            .unwrap();
+        writeln!(f, "{}\t1\tnew\tUC1\tvidX\ttsX\ttitle", u64::MAX).unwrap();
+        drop(f);
+
+        // With the old `e.seq + 1`, next_seq wrapped to 0 (release) → max_seq()==0,
+        // silently breaking cursor monotonicity. saturating_add pins it at u64::MAX.
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.max_seq(), u64::MAX - 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

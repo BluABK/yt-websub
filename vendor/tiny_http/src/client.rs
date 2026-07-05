@@ -78,6 +78,14 @@ impl ClientConnection {
     /// Reads until `CRLF` is reached. The next read will start
     ///  at the first byte of the new line.
     fn read_next_line(&mut self) -> IoResult<AsciiString> {
+        // LOCAL PATCH (yt-websub): cap a single request/header line. Upstream grew
+        // `buf` one byte at a time until CRLF with no limit, so an unauthenticated
+        // client streaming a line that never terminates could force unbounded
+        // allocation and, under MemoryMax, OOM-kill the whole process. This runs
+        // during header parsing, before any auth, so the size cap is the only
+        // defense. The error propagates up and closes the connection.
+        const MAX_LINE_BYTES: usize = 8 * 1024;
+
         let mut buf = Vec::new();
         let mut prev_byte_was_cr = false;
 
@@ -98,6 +106,12 @@ impl ClientConnection {
             prev_byte_was_cr = byte == b'\r';
 
             buf.push(byte);
+            if buf.len() > MAX_LINE_BYTES {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "request or header line exceeds maximum length",
+                ));
+            }
         }
     }
 
@@ -116,6 +130,11 @@ impl ClientConnection {
 
             // getting all headers
             let headers = {
+                // LOCAL PATCH (yt-websub): bound the number of header lines so a
+                // client cannot exhaust memory with an endless stream of tiny
+                // headers (each individually capped by read_next_line).
+                const MAX_HEADERS: usize = 128;
+
                 let mut headers = Vec::new();
                 loop {
                     let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
@@ -123,6 +142,12 @@ impl ClientConnection {
                     if line.is_empty() {
                         break;
                     };
+                    if headers.len() >= MAX_HEADERS {
+                        return Err(ReadError::ReadIoError(IoError::new(
+                            ErrorKind::InvalidInput,
+                            "too many request headers",
+                        )));
+                    }
                     headers.push(match FromStr::from_str(line.as_str().trim()) {
                         // TODO: remove this conversion
                         Ok(h) => h,

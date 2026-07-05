@@ -33,15 +33,21 @@ cd "$SRC_DIR" || exit 1
 echo "==> Building release (cargo build --release)..."
 if cargo build --release; then
     echo "==> Build OK -- installing $BIN_PATH"
-    $SUDO install -m 0755 target/release/yt-websub "$BIN_PATH"
-    echo "==> Restarting $SERVICE"
-    $SUDO systemctl restart "$SERVICE"
-    if $SUDO systemctl is-active --quiet "$SERVICE"; then
+    if ! $SUDO install -m 0755 target/release/yt-websub "$BIN_PATH"; then
+        # Do NOT restart: that would bounce the service onto the stale old binary
+        # while reporting success, e.g. after a security fix that never landed.
+        echo "error: install failed -- NOT restarting (service keeps the old binary)." >&2
+        RC=1
+    elif ! $SUDO systemctl restart "$SERVICE"; then
+        echo "error: restart failed -- check: journalctl -u $SERVICE -n 30 --no-pager" >&2
+        RC=1
+    elif $SUDO systemctl is-active --quiet "$SERVICE"; then
         echo "==> $SERVICE is active."
+        RC=0
     else
         echo "warning: $SERVICE is not active -- check: journalctl -u $SERVICE -n 30 --no-pager" >&2
+        RC=1
     fi
-    RC=0
 else
     echo "error: build failed -- not installing or restarting." >&2
     RC=1

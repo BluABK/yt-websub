@@ -76,6 +76,16 @@ impl Config {
             .trim_end_matches('/')
             .to_string();
         let bearer_token = req("YTWEBSUB_BEARER_TOKEN")?;
+        // Fail closed on the shipped placeholder or an obviously weak token: the
+        // /api surface is internet-exposed, and the example value is public in this
+        // repo. Refuse to start rather than silently run with no real auth.
+        if bearer_token.starts_with("CHANGE_ME") || bearer_token.len() < 32 {
+            return Err(
+                "YTWEBSUB_BEARER_TOKEN looks unset or too weak; set a random token of at \
+                 least 32 characters (e.g. `openssl rand -hex 32`)"
+                    .to_string(),
+            );
+        }
         let tls_cert = req("YTWEBSUB_TLS_CERT")?;
         let tls_key = req("YTWEBSUB_TLS_KEY")?;
         let storage_dir =
@@ -134,7 +144,11 @@ not_a_kv_line
     fn from_map_applies_defaults_and_requires_keys() {
         let mut m = HashMap::new();
         m.insert("YTWEBSUB_CALLBACK_BASE".into(), "https://h.example.com/".into());
-        m.insert("YTWEBSUB_BEARER_TOKEN".into(), "tok".into());
+        // 64-char token: must pass the placeholder/length check in from_map.
+        m.insert(
+            "YTWEBSUB_BEARER_TOKEN".into(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        );
         m.insert("YTWEBSUB_TLS_CERT".into(), "/c.pem".into());
         m.insert("YTWEBSUB_TLS_KEY".into(), "/k.pem".into());
         let cfg = Config::from_map(&m).unwrap();
@@ -146,5 +160,28 @@ not_a_kv_line
 
         m.remove("YTWEBSUB_TLS_CERT");
         assert!(Config::from_map(&m).is_err());
+    }
+
+    #[test]
+    fn rejects_placeholder_and_weak_bearer_token() {
+        let mut m = HashMap::new();
+        m.insert("YTWEBSUB_CALLBACK_BASE".into(), "https://h.example.com".into());
+        m.insert("YTWEBSUB_TLS_CERT".into(), "/c.pem".into());
+        m.insert("YTWEBSUB_TLS_KEY".into(), "/k.pem".into());
+
+        // The shipped placeholder must be refused.
+        m.insert("YTWEBSUB_BEARER_TOKEN".into(), "CHANGE_ME_long_random_token".into());
+        assert!(Config::from_map(&m).is_err());
+
+        // Too short must be refused.
+        m.insert("YTWEBSUB_BEARER_TOKEN".into(), "deadbeef".into());
+        assert!(Config::from_map(&m).is_err());
+
+        // A proper 48-char random-looking token is accepted.
+        m.insert(
+            "YTWEBSUB_BEARER_TOKEN".into(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        );
+        assert!(Config::from_map(&m).is_ok());
     }
 }
