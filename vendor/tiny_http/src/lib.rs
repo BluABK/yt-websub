@@ -160,7 +160,11 @@ impl From<Request> for Message {
 }
 
 // this trait is to make sure that Server implements Share and Send
+// LOCAL PATCH (yt-websub): the trait is never referenced as a bound (only the
+// impl below acts as a compile-time Send+Sync assertion for Server), so silence
+// the dead_code warning rather than deleting the assertion.
 #[doc(hidden)]
+#[allow(dead_code)]
 trait MustBeShareDummy: Sync + Send {}
 #[doc(hidden)]
 impl MustBeShareDummy for Server {}

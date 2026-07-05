@@ -4,7 +4,9 @@ pub use self::fused_reader::FusedReader;
 pub use self::messages_queue::MessagesQueue;
 pub use self::refined_tcp_stream::RefinedTcpStream;
 pub use self::sequential::{SequentialReader, SequentialReaderBuilder};
-pub use self::sequential::{SequentialWriter, SequentialWriterBuilder};
+// LOCAL PATCH (yt-websub): drop the unused `SequentialWriter` re-export (the type
+// is only used within sequential.rs); keeps the build warning-free.
+pub use self::sequential::SequentialWriterBuilder;
 pub use self::task_pool::TaskPool;
 
 use std::str::FromStr;

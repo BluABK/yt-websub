@@ -4,9 +4,12 @@
 use std::os::unix::net as unix_net;
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    path::PathBuf,
     time::Duration,
 };
+// LOCAL PATCH (yt-websub): PathBuf is only used by the Unix-socket paths, so gate
+// its import to keep non-Unix (dev) builds warning-free too.
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// LOCAL PATCH (yt-websub): per-socket read/write timeout applied to every
 /// accepted TCP connection. A single blocking read/write that makes no progress
