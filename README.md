@@ -28,8 +28,9 @@ subscribe, verify, receive, persist, and serve.
   timer thread. Idle CPU ~0%, RSS a few MB, ~2 MB binary.
 - **Few dependencies:** `tiny_http` (HTTP/1.1 + rustls TLS), `ureq` (outbound HTTPS), `hmac` + `sha1`
   (signature verification), `getrandom` (per-sub secrets). No tokio, no serde, no SQLite.
-- **Durable & crash-safe:** every event is `fsync`'d before the hub gets its 2xx; the subscription
-  state file is rewritten atomically (tmp + rename); a torn final log line is skipped on load.
+- **Durable & crash-safe:** every event is `fsync`'d before the hub gets its 2xx; state files
+  (`subs.tsv`, `ack.txt`) are rewritten atomically (tmp + fsync + rename); a torn final log line is
+  skipped on load.
 - **Per-subscription callback path** (`/yt/cb/<token>`) identifies which subscription — and thus
   which secret — a notification belongs to, so the body is never trusted to pick the verification key.
 
@@ -40,8 +41,13 @@ Requires a Rust toolchain (stable). Build the release binary:
 ```sh
 cargo build --release
 # -> target/release/yt-websub
-cargo test            # 20 unit tests (config, HMAC vectors, atom, store durability, ...)
+cargo test            # 30 tests: config, HMAC vectors, atom, store durability, SSRF allowlist,
+                      # + DoS regressions (oversized headers, huge Content-Length)
 ```
+
+`tiny_http` is **vendored** under `vendor/tiny_http/` (via `[patch.crates-io]`) with several local
+hardening patches for the internet-facing listener — all marked `LOCAL PATCH (yt-websub)` and listed
+in the `Cargo.toml` patch comment. See **Security notes** below.
 
 Build on the VPS, or cross-compile and copy the binary to `/usr/local/bin/yt-websub`.
 
@@ -209,8 +215,37 @@ Settings used on the streamarchiver side: `websub_vps_url`, `websub_token`, `web
 
 ## Security notes
 
+**Authentication & integrity**
 - Inbound callback authenticity rests on a **per-subscription random secret** + constant-time
   HMAC-SHA1 over the body; bad/missing signatures are dropped (acked with 204, never appended).
-- `/api` is protected by a bearer token over TLS; optionally also firewall it to your home IP.
+  Stored events are attributed to the subscription they authenticated on — not to the `channel_id`
+  claimed in the (signed) body — and every stored field is encoded so a malformed feed can't corrupt
+  or forge log rows.
+- `/api` is protected by a constant-time bearer-token compare over TLS; optionally also firewall it
+  to your home IP. The server **refuses to start** with the shipped placeholder or a bearer token
+  shorter than 32 chars.
 - Secrets are generated per subscription (OS RNG) — a single leak doesn't compromise other channels.
-- Run as the unprivileged `yt-websub` user under the provided systemd sandbox.
+
+**Secrets at rest**
+- `subs.tsv` (per-sub secrets + callback tokens) and the copied TLS `key.pem` are written `0600`; the
+  state directory is `0750` with `UMask=0077`, so no other local user can read them.
+
+**Denial-of-service resistance** (the listener is internet-facing)
+- Per-socket read/write timeouts drop slowloris clients; the `tiny_http` worker pool is bounded and
+  never panics on a thread-spawn failure, so hitting a resource ceiling drops one connection instead
+  of aborting the process.
+- Request-line length, header size, header count, and the unread-body drain are all capped, so no
+  single request can force unbounded allocation. (These are the `vendor/tiny_http` local patches.)
+- The event log is streamed (never read whole into memory) and has an ack-independent retention
+  floor, so a stalled consumer can't grow it into an out-of-memory crash-loop.
+
+**Outbound (SSRF)**
+- Channel-handle resolution only ever fetches `https://` youtube.com hosts, follows no redirects, and
+  caps the response size — so an API-supplied channel entry can't make the server probe internal or
+  cloud-metadata endpoints.
+
+**Process**
+- Runs as the unprivileged `yt-websub` user under the provided systemd sandbox. `panic = "abort"`
+  plus `StartLimitIntervalSec`/`StartLimitBurst` mean an unexpected crash restarts cleanly while a
+  genuine crash-loop surfaces as a failed unit instead of flapping silently (set
+  `StartLimitIntervalSec=0` to prefer availability over surfacing).
