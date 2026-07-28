@@ -160,7 +160,7 @@ All `/api/*` routes require `Authorization: Bearer <YTWEBSUB_BEARER_TOKEN>`.
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
-| GET | `/api/health` | – | `{"ok":true,"subs_active":k,"max_seq":N,"now":t}` |
+| GET | `/api/health` | – | `{"ok":true,"subs_active":k,"max_seq":N,"now":t,"uptime_secs":f,"version":"x.y.z"}` |
 | GET | `/api/channels` | – | `{"channels":[{"channel_id":"UC..","state":"active","lease_seconds":L,"expires_at":t,"fail_count":0,"topic":"…"}],"count":k}` |
 | GET | `/api/events` | `?after=<seq>&max=<n≤2000>` | `{"events":[…],"max_seq":N}` |
 | POST | `/api/channels` | `{"channels":["UC..","@handle",…]}` | `{"subscribed":n,"unsubscribed":m,"active":k}` |

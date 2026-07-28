@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -24,4 +25,7 @@ pub struct App {
     /// Serializes whole `reconcile` runs (API-driven vs. the renewal thread) so
     /// they can't both subscribe the same new channel concurrently.
     pub reconcile_lock: Mutex<()>,
+    /// Process start time, for `/api/health`'s `uptime_secs` — the client polls
+    /// this to show the VPS server's own uptime, not just reachability.
+    pub started_at: Instant,
 }

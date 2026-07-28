@@ -47,10 +47,12 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
                 req,
                 200,
                 format!(
-                    "{{\"ok\":true,\"subs_active\":{},\"max_seq\":{},\"now\":{}}}",
+                    "{{\"ok\":true,\"subs_active\":{},\"max_seq\":{},\"now\":{},\"uptime_secs\":{},\"version\":{}}}",
                     active,
                     max_seq,
-                    now_unix()
+                    now_unix(),
+                    app.started_at.elapsed().as_secs_f64(),
+                    json_string(env!("CARGO_PKG_VERSION"))
                 ),
             );
         }

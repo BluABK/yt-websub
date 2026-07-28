@@ -62,6 +62,7 @@ fn main() {
         subs: Mutex::new(registry),
         resolve_cache: Mutex::new(load_cache(&cfg.storage_dir)),
         reconcile_lock: Mutex::new(()),
+        started_at: std::time::Instant::now(),
     });
 
     {
