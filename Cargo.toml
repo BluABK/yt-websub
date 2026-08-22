@@ -28,6 +28,11 @@ getrandom = "0.2"
 #   - util/task_pool.rs: bounded, non-panicking worker spawn (was: unbounded
 #     thread::spawn -> panic/abort at the TasksMax pid ceiling).
 #   - ssl/rustls.rs: non-panicking private-key loader (was: expect()/index panic).
+#   - lib.rs: bounded request-completion wait in the HTTPS client loop (was:
+#     unbounded recv() -> a request whose notify never fires eats a pool worker
+#     forever; 19 eaten workers made the 2026-08-22 relay deaf to new
+#     connections, including hub pushes, while existing keep-alives stayed
+#     green). On timeout the connection is dropped and the worker reclaimed.
 [patch.crates-io]
 tiny_http = { path = "vendor/tiny_http" }
 

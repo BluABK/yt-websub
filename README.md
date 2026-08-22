@@ -236,6 +236,12 @@ Settings used on the streamarchiver side: `websub_vps_url`, `websub_token`, `web
   of aborting the process.
 - Request-line length, header size, header count, and the unread-body drain are all capped, so no
   single request can force unbounded allocation. (These are the `vendor/tiny_http` local patches.)
+- Each in-flight request's completion wait is bounded (5 min): a request that never finishes —
+  whatever swallowed its completion notify — costs one dropped connection, not a permanently-eaten
+  pool worker. Without this, eaten workers accumulate until the pool is full and the server goes
+  deaf to **new** connections (hub pushes included) while existing keep-alive connections still get
+  served — so the consumer's health checks over a pooled connection keep reporting healthy. This is
+  exactly what happened on 2026-08-22; the reap logs the peer address to journald when it fires.
 - The event log is streamed (never read whole into memory) and has an ack-independent retention
   floor, so a stalled consumer can't grow it into an out-of-memory crash-loop.
 

@@ -330,8 +330,42 @@ impl Server {
                                 if client.secure() {
                                     let (sender, receiver) = mpsc::channel();
                                     for rq in client {
+                                        let peer = rq.remote_addr().copied();
                                         messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
+                                        // LOCAL PATCH (yt-websub): bound the wait for the
+                                        // request-completion notify. Production incident
+                                        // 2026-08-22: 19 of 20 pool workers were parked in an
+                                        // unbounded `recv()` here for a notify that never came,
+                                        // exhausting the pool — the server kept its existing
+                                        // keep-alive connections alive (so health checks over
+                                        // them looked green) while every NEW connection,
+                                        // including the WebSub hub's push deliveries, queued
+                                        // forever: a deaf relay that reported healthy. Whatever
+                                        // swallows the notify (dropped-without-respond request,
+                                        // stalled response write, ...), a bounded wait converts
+                                        // a permanently-eaten worker into one dropped
+                                        // connection. 5 minutes is far beyond any legitimate
+                                        // request's lifetime here (handlers are lock-plus-20s
+                                        // outbound-call bounded) yet reaps zombies promptly
+                                        // relative to lease renewals. The log line names the
+                                        // peer so the underlying mechanism can be identified
+                                        // from journald if it ever fires.
+                                        match receiver.recv_timeout(std::time::Duration::from_secs(300)) {
+                                            Ok(()) => {}
+                                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                                eprintln!(
+                                                    "[tiny_http] request from {} never completed within 300s; \
+                                                     dropping connection to reclaim its worker",
+                                                    peer.map(|p| p.to_string()).unwrap_or_else(|| "<unknown>".into()),
+                                                );
+                                                break;
+                                            }
+                                            // All senders gone without a notify: the request was
+                                            // torn down abnormally. The connection state is
+                                            // unknowable — drop it (upstream `unwrap()` aborted
+                                            // the whole process here under panic=abort).
+                                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                        }
                                     }
                                 } else {
                                     for rq in client {
