@@ -12,7 +12,13 @@ use crate::subs::Sub;
 pub fn send(cfg: &Config, sub: &Sub, mode: &str) -> Result<u16, String> {
     let callback = format!("{}/yt/cb/{}", cfg.callback_base, sub.token);
     let lease = cfg.lease_seconds.to_string();
-    let agent = ureq::builder().timeout(Duration::from_secs(20)).build();
+    // Longer than it looks like it needs to be, on purpose. Google's hub takes
+    // ~20.3s to answer a subscribe it is going to refuse ("503 Transient error;
+    // please try again later"), so a 20s client timeout turned every one of
+    // those into an opaque transport error instead of a status code worth
+    // logging. Measured 2026-09-06, when the hub refused every subscribe
+    // request — any topic, any callback — and the relay could not say so.
+    let agent = ureq::builder().timeout(Duration::from_secs(60)).build();
     let resp = agent.post(&cfg.hub_url).send_form(&[
         ("hub.callback", callback.as_str()),
         ("hub.topic", sub.topic.as_str()),

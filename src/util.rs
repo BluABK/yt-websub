@@ -68,6 +68,19 @@ pub fn rand_hex(n: usize) -> String {
     hex_encode(&buf)
 }
 
+/// A uniform-ish random number in `0..n` (0 when `n` is 0).
+///
+/// Used only for retry jitter, where the modulo bias across a `u64` is
+/// immaterial — do not reach for this where uniformity matters.
+pub fn rand_below(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).expect("OS RNG failed");
+    u64::from_le_bytes(buf) % n
+}
+
 /// Percent-encode only structural/control bytes so a string is safe to store as
 /// one TSV field. Multi-byte UTF-8 passes through unchanged (its bytes are all
 /// >= 0x80 and never collide with the escaped set), so titles stay readable.

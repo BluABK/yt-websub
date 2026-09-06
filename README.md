@@ -160,11 +160,29 @@ All `/api/*` routes require `Authorization: Bearer <YTWEBSUB_BEARER_TOKEN>`.
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
-| GET | `/api/health` | – | `{"ok":true,"subs_active":k,"max_seq":N,"now":t,"uptime_secs":f,"version":"x.y.z"}` |
-| GET | `/api/channels` | – | `{"channels":[{"channel_id":"UC..","state":"active","lease_seconds":L,"expires_at":t,"fail_count":0,"topic":"…"}],"count":k}` |
+| GET | `/api/health` | – | `{"ok":true,"subs_active":k,"subs_expired":e,"subs_failed":f,"subs_pending":p,"subs_total":n,"max_seq":N,"now":t,"uptime_secs":f,"version":"x.y.z"}` |
+| GET | `/api/channels` | – | `{"channels":[{"channel_id":"UC..","state":"active","lease_seconds":L,"expires_at":t,"fail_count":0,"last_subscribe_at":t,"next_attempt_at":t,"last_error":"","topic":"…"}],"count":k}` |
 | GET | `/api/events` | `?after=<seq>&max=<n≤2000>` | `{"events":[…],"max_seq":N}` |
 | POST | `/api/channels` | `{"channels":["UC..","@handle",…]}` | `{"subscribed":n,"unsubscribed":m,"active":k}` |
 | POST | `/api/ack` | `{"through":<seq>}` | `{"ok":true}` (advances compaction horizon) |
+
+**Reading subscription health.** `subs_active` counts only subscriptions the hub
+is actually delivering to — state `active` *and* still inside the lease. A sub
+whose lease has run out is counted in `subs_expired`, never folded into
+`subs_active`: the hub stopped delivering the moment the lease passed, whatever
+the local state field says. Monitor `subs_expired` and `subs_failed`, not just
+`ok:true` — a relay can be perfectly healthy and subscribed to nothing.
+
+`state` is one of `pending` (subscribe sent, hub has not verified yet), `active`,
+`expired` (lease ran out; still retried), or `failed` (the hub refused the last
+attempt). When an attempt does not land, `last_error` carries the hub's own
+verdict — `HTTP 503`, a transport error — and `next_attempt_at` says when the
+backoff next lets it try. Both are worth reading before going anywhere near the
+host's journal.
+
+Note that a `POST /api/channels` carrying a channel already in the registry is a
+no-op for that channel: reconcile only diffs adds and removes, so re-posting the
+same set never re-subscribes anything.
 
 Event object:
 
@@ -191,6 +209,35 @@ The callback routes are for YouTube's hub only:
    returns the event (a public CA cert means no `--cacert`). A missing/wrong token returns 401.
 4. `curl -H "Authorization: Bearer <token>" https://hooks.example.com/api/health` shows
    `subs_active`.
+
+## When nothing will subscribe
+
+Symptom: `subs_failed` climbing, `last_error` the same on every channel, and
+`subs_expired` growing behind it as leases run out one by one.
+
+First establish whether it is us or the hub, because the two look identical from
+here. Send a subscribe for a throwaway callback on a domain that has nothing to
+do with this host:
+
+```sh
+curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
+  -d 'hub.callback=https://example.com/cb' \
+  -d 'hub.topic=https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx' \
+  -d 'hub.mode=subscribe' -d 'hub.verify=async' \
+  https://pubsubhubbub.appspot.com/subscribe
+```
+
+If that also fails, the hub is refusing everyone and there is nothing to fix on
+this box — wait it out. Google answers a refusal with `503 Transient error;
+please try again later` after roughly 20 seconds, which is why [`hub::send`]
+allows 60: a shorter timeout turns an informative status code into an opaque
+transport error.
+
+While the hub is in that state, **do not cycle subscriptions to "refresh" them.**
+Dropping a channel and re-adding it cannot re-subscribe it, and it destroys the
+callback token the hub still holds — so any delivery for that channel lands on a
+404 until the hub recovers. A channel already in the registry is left strictly
+better alone.
 
 ## streamarchiver integration (planned, separate change)
 

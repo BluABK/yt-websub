@@ -19,9 +19,24 @@ const PENDING_TIMEOUT: u64 = 600; // re-send if a subscribe was never verified
 const RENEW_COOLDOWN: u64 = 300; // wait after a (re)subscribe send before retrying
 const COMPACT_EVERY_TICKS: u64 = 60; // ~hourly
 
+/// Pause between consecutive hub requests inside one reconcile/renew pass.
+///
+/// Subscriptions created together expire together, so they also come due
+/// together, and the loop used to fire the whole cohort at the hub back to
+/// back. Spacing them keeps one bad minute from taking out a whole cohort at
+/// once — and keeps us a well-behaved client of a hub we do not control.
+const HUB_SPACING_MS: u64 = 400;
+
+/// Exponential backoff for a failed (re)subscribe, plus jitter.
+///
+/// The jitter is not cosmetic. Without it a cohort that failed together
+/// retries together forever: same fail_count, same backoff, same instant,
+/// re-colliding on every round. Spreading the retry over a quarter of the
+/// interval breaks that lockstep.
 fn backoff(fail_count: u32) -> u64 {
     let factor = 1u64 << fail_count.min(6); // 1,2,4,...,64
-    (30 * factor).min(1800) // 30s .. 30m
+    let base = (30 * factor).min(1800); // 30s .. 30m
+    base + crate::util::rand_below(base / 4 + 1)
 }
 
 /// Change signature of channels.txt: (mtime_secs, len). Including the length as
@@ -167,54 +182,121 @@ fn reconcile_locked(app: &App) -> (usize, usize, usize) {
     };
 
     let mut subscribed = 0;
-    for cid in &to_add {
+    for (i, cid) in to_add.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(HUB_SPACING_MS));
+        }
         let mut s = subs::Sub::new(cid);
         s.last_subscribe_at = now_unix();
         // Register the token BEFORE contacting the hub so a fast async verify GET
         // (which carries this token) resolves instead of 404ing. The lock is held
         // only for the map insert, never across the network call below.
         app.subs.lock().unwrap().insert(s.clone());
-        match hub::send(&app.cfg, &s, "subscribe") {
-            Ok(code) if hub::is_ok(code) => {
+        match verdict(hub::send(&app.cfg, &s, "subscribe")) {
+            None => {
                 subscribed += 1;
-                eprintln!("[reconcile] subscribe {} -> {} (pending verify)", cid, code);
+                eprintln!("[reconcile] subscribe {} -> accepted (pending verify)", cid);
                 // Leave it pending; the verify GET will activate it.
             }
-            Ok(code) => {
-                eprintln!("[reconcile] subscribe {} -> HTTP {}", cid, code);
+            Some(why) => {
+                eprintln!("[reconcile] subscribe {} refused: {}", cid, why);
                 s.state = "failed".into();
                 s.fail_count = 1;
                 s.next_attempt_at = now_unix() + backoff(1);
-                merge_attempt(app, s);
-            }
-            Err(e) => {
-                eprintln!("[reconcile] subscribe {} error: {}", cid, e);
-                s.state = "failed".into();
-                s.fail_count = 1;
-                s.next_attempt_at = now_unix() + backoff(1);
+                s.last_error = why;
                 merge_attempt(app, s);
             }
         }
     }
 
     let mut unsubscribed = 0;
-    for s in &to_remove {
+    for (i, s) in to_remove.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(HUB_SPACING_MS));
+        }
         let _ = hub::send(&app.cfg, s, "unsubscribe");
-        app.subs.lock().unwrap().remove(&s.channel_id);
+        // Removing here drops the sub from the live map but KEEPS its callback
+        // token answerable for a grace period, because the hub verifies an
+        // unsubscribe with a GET to that same token path. Dropping the token
+        // outright made that GET 404, the hub abandoned the unsubscribe, and the
+        // removal only ever took effect on our side.
+        app.subs.lock().unwrap().remove(&s.channel_id, now_unix());
         unsubscribed += 1;
-        eprintln!("[reconcile] unsubscribe {}", s.channel_id);
+        eprintln!("[reconcile] unsubscribe {} (pending verify)", s.channel_id);
     }
 
     let reg = app.subs.lock().unwrap();
     let _ = reg.save();
-    let active = reg.subs.values().filter(|s| s.state == "active").count();
-    (subscribed, unsubscribed, active)
+    (subscribed, unsubscribed, live_count(&reg, now_unix()))
+}
+
+/// Reduce a `hub::send` result to "accepted" (`None`) or why it was not.
+///
+/// A transport failure and an HTTP rejection are the same event to every
+/// caller — the request did not land — and both have to end up in the same
+/// stored field, so they are collapsed once, here, rather than in each of the
+/// four call sites that used to duplicate the pair of match arms.
+fn verdict(res: Result<u16, String>) -> Option<String> {
+    match res {
+        Ok(code) if hub::is_ok(code) => None,
+        Ok(code) => Some(format!("HTTP {}", code)),
+        Err(e) => Some(subs::clamp_error(&e)),
+    }
+}
+
+/// Subscriptions the hub is actually delivering to: `active` AND still inside
+/// their lease.
+///
+/// Counting bare `state == "active"` is what let a third of the fleet sit
+/// unsubscribed behind a green `/api/health` — the state field is only ever
+/// as fresh as the last renewal that managed to complete.
+fn live_count(reg: &subs::Registry, now: u64) -> usize {
+    reg.subs
+        .values()
+        .filter(|s| s.state == "active" && !s.lease_expired(now))
+        .count()
 }
 
 /// Re-send subscribe for leases nearing expiry, unverified-too-long subscribes,
 /// and failed subscriptions whose backoff has elapsed.
+/// Demote any `active` sub whose lease has quietly run out.
+///
+/// An active sub that fails renewal keeps `state = "active"` on purpose, so a
+/// brief hub blip does not report a coverage gap that isn't there. The bug was
+/// that it kept it *forever*: once the lease passed, the hub had stopped
+/// delivering, the expiry never advanced again, and `/api/health` still counted
+/// the sub as active. On 2026-09-06 twelve subscriptions had been dead for up
+/// to 1.8 days that way, one of them behind 73 consecutive failed renewals.
+///
+/// Demoting to `expired` keeps the sub in the registry and still due for
+/// retry — it only stops it claiming to be delivering.
+fn expire_lapsed(app: &App, now: u64) {
+    let mut reg = app.subs.lock().unwrap();
+    let lapsed: Vec<String> = reg
+        .subs
+        .values()
+        .filter(|s| s.state == "active" && s.lease_expired(now))
+        .map(|s| s.channel_id.clone())
+        .collect();
+    if lapsed.is_empty() {
+        return;
+    }
+    for cid in &lapsed {
+        if let Some(s) = reg.subs.get_mut(cid) {
+            s.state = "expired".into();
+            eprintln!(
+                "[renew] {} lease expired {}s ago; no longer counted active",
+                cid,
+                now.saturating_sub(s.expires_at)
+            );
+        }
+    }
+    let _ = reg.save();
+}
+
 fn renew_due(app: &App) {
     let now = now_unix();
+    expire_lapsed(app, now);
     let candidates: Vec<subs::Sub> = {
         let reg = app.subs.lock().unwrap();
         reg.subs
@@ -226,7 +308,9 @@ fn renew_due(app: &App) {
                 match s.state.as_str() {
                     "active" => s.expires_at > 0 && now + RENEW_LEAD >= s.expires_at,
                     "pending" => now.saturating_sub(s.last_subscribe_at) > PENDING_TIMEOUT,
-                    "failed" => true,
+                    // A lapsed lease is as retryable as an outright failure —
+                    // more so, since it is a channel we believed we had.
+                    "failed" | "expired" => true,
                     _ => false,
                 }
             })
@@ -234,11 +318,14 @@ fn renew_due(app: &App) {
             .collect()
     };
 
-    for mut s in candidates {
+    for (i, mut s) in candidates.into_iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(HUB_SPACING_MS));
+        }
         let was_active = s.state == "active";
         s.last_subscribe_at = now_unix();
-        match hub::send(&app.cfg, &s, "subscribe") {
-            Ok(code) if hub::is_ok(code) => {
+        match verdict(hub::send(&app.cfg, &s, "subscribe")) {
+            None => {
                 // The verify GET will (re)set active + expires_at. An active sub
                 // stays active in the meantime, so there is no coverage gap. Set
                 // a cooldown so we don't re-send every tick while the verify GET
@@ -247,22 +334,16 @@ fn renew_due(app: &App) {
                     s.state = "pending".into();
                 }
                 s.fail_count = 0;
+                s.last_error.clear();
                 s.next_attempt_at = now_unix() + RENEW_COOLDOWN;
             }
-            Ok(code) => {
-                eprintln!("[renew] {} -> HTTP {}", s.channel_id, code);
+            Some(why) => {
+                eprintln!("[renew] {} refused: {}", s.channel_id, why);
                 s.fail_count += 1;
                 if !was_active {
                     s.state = "failed".into();
                 }
-                s.next_attempt_at = now_unix() + backoff(s.fail_count);
-            }
-            Err(e) => {
-                eprintln!("[renew] {} error: {}", s.channel_id, e);
-                s.fail_count += 1;
-                if !was_active {
-                    s.state = "failed".into();
-                }
+                s.last_error = why;
                 s.next_attempt_at = now_unix() + backoff(s.fail_count);
             }
         }
@@ -301,11 +382,72 @@ pub fn run(app: Arc<App>) {
 mod tests {
     use super::*;
 
+    /// The backoff still doubles and still caps; jitter only ever extends the
+    /// wait, and by at most a quarter — never shortens it, or a hard-failing
+    /// cohort would creep towards hammering the hub.
     #[test]
     fn backoff_grows_and_caps() {
-        assert_eq!(backoff(0), 30);
-        assert_eq!(backoff(1), 60);
-        assert_eq!(backoff(2), 120);
-        assert_eq!(backoff(10), 1800); // capped
+        for _ in 0..200 {
+            assert!((30..=37).contains(&backoff(0)), "{}", backoff(0));
+            assert!((60..=75).contains(&backoff(1)));
+            assert!((120..=150).contains(&backoff(2)));
+            assert!((1800..=2250).contains(&backoff(10))); // capped base + jitter
+        }
+    }
+
+    /// A cohort that failed together must not retry in lockstep forever.
+    #[test]
+    fn backoff_jitter_actually_spreads_a_cohort() {
+        let waits: std::collections::HashSet<u64> = (0..50).map(|_| backoff(6)).collect();
+        assert!(
+            waits.len() > 10,
+            "jitter collapsed to {} distinct waits; a cohort would re-collide every round",
+            waits.len()
+        );
+    }
+
+    /// Transport failure and HTTP rejection are the same event to the caller,
+    /// and an accepted request must record no error at all.
+    #[test]
+    fn verdict_collapses_both_failure_shapes() {
+        assert_eq!(verdict(Ok(202)), None);
+        assert_eq!(verdict(Ok(204)), None);
+        assert_eq!(verdict(Ok(503)), Some("HTTP 503".to_string()));
+        assert_eq!(verdict(Ok(409)), Some("HTTP 409".to_string()));
+        assert_eq!(
+            verdict(Err("timed out reading response".into())),
+            Some("timed out reading response".to_string())
+        );
+    }
+
+    /// The count behind `/api/health` must exclude a sub whose lease has run
+    /// out, however its state field still reads. This is the whole bug: on
+    /// 2026-09-06 twelve subs sat `active` with leases up to 1.8 days dead and
+    /// the endpoint reported full coverage.
+    #[test]
+    fn live_count_excludes_a_lapsed_lease() {
+        let dir = std::env::temp_dir().join("yt_websub_test_live_count");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut reg = subs::Registry::load(&dir.join("subs.tsv"));
+        let now = 1_000_000u64;
+
+        let mut good = subs::Sub::new("UCgood0000000000000000a");
+        good.state = "active".into();
+        good.expires_at = now + 60;
+        reg.insert(good);
+
+        let mut lapsed = subs::Sub::new("UClapsed00000000000000b");
+        lapsed.state = "active".into(); // never demoted: the pre-fix shape
+        lapsed.expires_at = now - 1;
+        reg.insert(lapsed);
+
+        let mut never = subs::Sub::new("UCnever000000000000000c");
+        never.state = "active".into();
+        never.expires_at = 0; // verified but no expiry recorded
+        reg.insert(never);
+
+        assert_eq!(live_count(&reg, now), 2, "only the lapsed sub should drop out");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

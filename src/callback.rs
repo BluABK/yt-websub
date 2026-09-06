@@ -23,7 +23,11 @@ pub fn handle(app: &App, req: Request, token: &str, query: &str) {
             Some(s) => s,
             None => {
                 drop(reg);
-                let _ = req.respond(Response::empty(404u16));
+                // Not a live subscription — but it may be one we have just asked
+                // the hub to drop, whose unsubscribe the hub is now verifying.
+                // That GET has to be answered or the hub abandons the unsubscribe
+                // and keeps delivering to a callback we no longer recognise.
+                finish_unsubscribe(app, req, token, query);
                 return;
             }
         }
@@ -34,6 +38,33 @@ pub fn handle(app: &App, req: Request, token: &str, query: &str) {
         Method::Post => handle_notify(app, req, &sub),
         _ => {
             let _ = req.respond(Response::empty(405u16));
+        }
+    }
+}
+
+/// Answer the hub's verification GET for a subscription we have already
+/// removed. Responds either way (challenge on a match, 404 otherwise), so the
+/// caller must not respond again.
+///
+/// Only `hub.mode=unsubscribe` is honoured here: a *subscribe* verification for
+/// a token we no longer hold is not something to confirm — echoing the
+/// challenge would tell the hub to start delivering to a callback that will
+/// never be recognised again.
+fn finish_unsubscribe(app: &App, req: Request, token: &str, query: &str) {
+    let mode = query_get(query, "hub.mode").unwrap_or_default();
+    let topic = query_get(query, "hub.topic").unwrap_or_default();
+    let challenge = query_get(query, "hub.challenge").unwrap_or_default();
+    let now = now_unix();
+
+    let expected = app.subs.lock().unwrap().unsub_topic(token, now);
+    match expected {
+        Some(t) if mode == "unsubscribe" && t == topic && !challenge.is_empty() => {
+            app.subs.lock().unwrap().forget_unsub(token, now);
+            eprintln!("[verify] unsubscribed topic={}", topic);
+            let _ = req.respond(Response::from_string(challenge));
+        }
+        _ => {
+            let _ = req.respond(Response::empty(404u16));
         }
     }
 }

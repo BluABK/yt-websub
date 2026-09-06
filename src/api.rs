@@ -38,19 +38,40 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
 
     match (req.method().clone(), path) {
         (Method::Get, "/api/health") => {
-            let active = {
+            let now = now_unix();
+            // `subs_active` counts only subscriptions the hub is actually
+            // delivering to: state `active` AND inside the lease. A sub whose
+            // lease has run out is reported separately as `subs_expired`, never
+            // folded into the active count — doing so is what kept this endpoint
+            // green while a third of the fleet was silently unsubscribed.
+            let (mut active, mut expired, mut failed, mut pending, mut total) = (0, 0, 0, 0, 0);
+            {
                 let reg = app.subs.lock().unwrap();
-                reg.subs.values().filter(|s| s.state == "active").count()
-            };
+                for s in reg.subs.values() {
+                    total += 1;
+                    match s.state.as_str() {
+                        "active" if !s.lease_expired(now) => active += 1,
+                        "active" | "expired" => expired += 1,
+                        "pending" => pending += 1,
+                        _ => failed += 1,
+                    }
+                }
+            }
             let max_seq = app.store.lock().unwrap().max_seq();
             json_response(
                 req,
                 200,
                 format!(
-                    "{{\"ok\":true,\"subs_active\":{},\"max_seq\":{},\"now\":{},\"uptime_secs\":{},\"version\":{}}}",
+                    "{{\"ok\":true,\"subs_active\":{},\"subs_expired\":{},\"subs_failed\":{},\
+                     \"subs_pending\":{},\"subs_total\":{},\"max_seq\":{},\"now\":{},\
+                     \"uptime_secs\":{},\"version\":{}}}",
                     active,
+                    expired,
+                    failed,
+                    pending,
+                    total,
                     max_seq,
-                    now_unix(),
+                    now,
                     app.started_at.elapsed().as_secs_f64(),
                     json_string(env!("CARGO_PKG_VERSION"))
                 ),
@@ -102,12 +123,20 @@ pub fn handle(app: &App, mut req: Request, path: &str, query: &str) {
                 }
                 // Note: secret/token are intentionally NOT exposed.
                 out.push_str(&format!(
-                    "{{\"channel_id\":{},\"state\":{},\"lease_seconds\":{},\"expires_at\":{},\"fail_count\":{},\"topic\":{}}}",
+                    "{{\"channel_id\":{},\"state\":{},\"lease_seconds\":{},\"expires_at\":{},\
+                     \"fail_count\":{},\"last_subscribe_at\":{},\"next_attempt_at\":{},\
+                     \"last_error\":{},\"topic\":{}}}",
                     json_string(&s.channel_id),
                     json_string(&s.state),
                     s.lease_seconds,
                     s.expires_at,
                     s.fail_count,
+                    s.last_subscribe_at,
+                    s.next_attempt_at,
+                    // The hub's own words on why the last attempt did not land.
+                    // Without this, a caller sees a rising fail_count and has to
+                    // go read journald on the host to learn anything at all.
+                    json_string(&s.last_error),
                     json_string(&s.topic)
                 ));
             }
