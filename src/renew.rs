@@ -265,7 +265,7 @@ fn live_count(reg: &subs::Registry, now: u64) -> usize {
 /// brief hub blip does not report a coverage gap that isn't there. The bug was
 /// that it kept it *forever*: once the lease passed, the hub had stopped
 /// delivering, the expiry never advanced again, and `/api/health` still counted
-/// the sub as active. On 2026-09-06 twelve subscriptions had been dead for up
+/// the sub as active. On 2026-09-06 fourteen subscriptions had been dead for up
 /// to 1.8 days that way, one of them behind 73 consecutive failed renewals.
 ///
 /// Demoting to `expired` keeps the sub in the registry and still due for
@@ -422,7 +422,7 @@ mod tests {
 
     /// The count behind `/api/health` must exclude a sub whose lease has run
     /// out, however its state field still reads. This is the whole bug: on
-    /// 2026-09-06 twelve subs sat `active` with leases up to 1.8 days dead and
+    /// 2026-09-06 fourteen subs sat `active` with leases up to 1.8 days dead and
     /// the endpoint reported full coverage.
     #[test]
     fn live_count_excludes_a_lapsed_lease() {
