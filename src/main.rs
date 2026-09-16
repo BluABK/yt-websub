@@ -15,6 +15,11 @@ mod resolve;
 mod sig;
 mod store;
 mod subs;
+// The build script's target-folder cleanup, compiled here only so its tests
+// run with the rest of the suite.
+#[cfg(test)]
+#[path = "../build_support/target_gc.rs"]
+mod target_gc;
 mod util;
 
 use std::collections::HashMap;

@@ -41,8 +41,8 @@ Requires a Rust toolchain (stable). Build the release binary:
 ```sh
 cargo build --release
 # -> target/release/yt-websub
-cargo test            # 30 tests: config, HMAC vectors, atom, store durability, SSRF allowlist,
-                      # + DoS regressions (oversized headers, huge Content-Length)
+cargo test            # 43 tests: config, HMAC vectors, atom, store durability, SSRF allowlist,
+                      # build-folder cleanup, + DoS regressions (oversized headers, huge Content-Length)
 ```
 
 `tiny_http` is **vendored** under `vendor/tiny_http/` (via `[patch.crates-io]`) with several local
@@ -50,6 +50,19 @@ hardening patches for the internet-facing listener — all marked `LOCAL PATCH (
 in the `Cargo.toml` patch comment. See **Security notes** below.
 
 Build on the VPS, or cross-compile and copy the binary to `/usr/local/bin/yt-websub`.
+
+**The build cleans up `target/` as it goes.** Cargo never deletes anything there, so every build
+flavour's incremental cache and every dependency version ever compiled stays on disk — on a small VPS
+that adds up. The build script (`build.rs`, logic in `build_support/target_gc.rs`) removes, at most
+once every six hours per profile, incremental caches last built more than a week before the newest
+one, and compiled dependencies whose version is no longer in `Cargo.lock` — only what the build in
+progress cannot be using — and prints one warning line when it freed something. `TARGET_GC=off`
+disables it, `dry` lists what would go without deleting, and `force` runs it regardless of when it
+last ran:
+
+```sh
+TARGET_GC=dry cargo build --release
+```
 
 ## Deploy on Debian
 
