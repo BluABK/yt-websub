@@ -47,11 +47,41 @@ pub struct Sub {
     pub last_error: String,
 }
 
+/// The topic YouTube publishes a channel's new videos (and go-lives) to.
+///
+/// It is the `/xml/feeds/` URL, not the RSS feed's own `/feeds/videos.xml`.
+/// Google's hub verifies a subscription to any URL, so subscribing the RSS
+/// address looked perfectly healthy (leases granted, renewed, verified) while
+/// YouTube stopped publishing to it: the hub's topic-details page showed its
+/// last ping on 2024-12-22, while the `/xml/` topic for the same channel was
+/// pinged a minute after a stream went live (checked 2026-11-18). Only a few
+/// upload-heavy channels ever reached the old topic, which is why it seemed
+/// to half work.
 pub fn topic_for(channel_id: &str) -> String {
     format!(
-        "https://www.youtube.com/feeds/videos.xml?channel_id={}",
+        "https://www.youtube.com/xml/feeds/videos.xml?channel_id={}",
         channel_id
     )
+}
+
+/// Move a sub stored with an older topic URL onto [`topic_for`]'s, and make
+/// it due for subscribing at once (the renew loop's next tick sends it; the
+/// hub's verification then confirms the new topic). The token and secret
+/// stay, so the callback URL does not change. The lease on the old topic
+/// simply runs out. Returns whether anything changed.
+fn migrate_topic(s: &mut Sub) -> bool {
+    let want = topic_for(&s.channel_id);
+    if s.topic == want {
+        return false;
+    }
+    s.topic = want;
+    s.state = "pending".to_string();
+    s.expires_at = 0;
+    s.last_subscribe_at = 0;
+    s.next_attempt_at = 0;
+    s.fail_count = 0;
+    s.last_error.clear();
+    true
 }
 
 impl Sub {
@@ -163,20 +193,31 @@ impl Registry {
     pub fn load(path: &Path) -> Registry {
         let mut subs = HashMap::new();
         let mut by_token = HashMap::new();
+        let mut migrated = 0;
         if let Ok(content) = fs::read_to_string(path) {
             for line in content.lines() {
-                if let Some(s) = parse_line(line) {
+                if let Some(mut s) = parse_line(line) {
+                    if migrate_topic(&mut s) {
+                        migrated += 1;
+                    }
                     by_token.insert(s.token.clone(), s.channel_id.clone());
                     subs.insert(s.channel_id.clone(), s);
                 }
             }
         }
-        Registry {
+        let reg = Registry {
             subs,
             by_token,
             unsub_pending: HashMap::new(),
             path: path.to_path_buf(),
+        };
+        if migrated > 0 {
+            eprintln!("[subs] {migrated} subscription(s) moved to the /xml/feeds/ topic; resubscribing");
+            if let Err(e) = reg.save() {
+                eprintln!("[subs] saving the moved topics failed: {e}");
+            }
         }
+        reg
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -260,6 +301,30 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sub_on_the_old_rss_topic_moves_to_the_xml_topic_and_is_due() {
+        let dir = std::env::temp_dir().join("yt_websub_test_migrate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("subs.tsv");
+        // A row as the pre-fix build wrote it: active, old topic.
+        let cid = "UCabcdefghijklmnopqrstuv";
+        let old = format!(
+            "{cid}\ttok123\thttps://www.youtube.com/feeds/videos.xml?channel_id={cid}\tsecret\tactive\t432000\t9999999999\t100\t0\t0\t\n"
+        );
+        fs::write(&path, old).unwrap();
+        let reg = Registry::load(&path);
+        let s = reg.subs.get(cid).unwrap();
+        assert_eq!(s.topic, format!("https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"));
+        assert_eq!(s.state, "pending");
+        assert_eq!((s.next_attempt_at, s.last_subscribe_at, s.expires_at), (0, 0, 0), "due at once");
+        assert_eq!((s.token.as_str(), s.secret.as_str()), ("tok123", "secret"), "same callback");
+        // Saved straight away, and loading again changes nothing more.
+        let again = Registry::load(&path);
+        assert_eq!(again.subs.get(cid).unwrap().state, "pending");
+        assert!(fs::read_to_string(&path).unwrap().contains("/xml/feeds/"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn save_load_roundtrip() {

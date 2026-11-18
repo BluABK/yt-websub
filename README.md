@@ -235,7 +235,7 @@ do with this host:
 ```sh
 curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
   -d 'hub.callback=https://example.com/cb' \
-  -d 'hub.topic=https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx' \
+  -d 'hub.topic=https://www.youtube.com/xml/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxxxxxxxxxx' \
   -d 'hub.mode=subscribe' -d 'hub.verify=async' \
   https://pubsubhubbub.appspot.com/subscribe
 ```
@@ -315,3 +315,21 @@ Settings used on the streamarchiver side: `websub_vps_url`, `websub_token`, `web
   plus `StartLimitIntervalSec`/`StartLimitBurst` mean an unexpected crash restarts cleanly while a
   genuine crash-loop surfaces as a failed unit instead of flapping silently (set
   `StartLimitIntervalSec=0` to prefer availability over surfacing).
+
+## The topic is `/xml/feeds/`, not the RSS feed's URL
+
+YouTube publishes a channel's new videos and go-lives to
+`https://www.youtube.com/xml/feeds/videos.xml?channel_id=UC…`. The RSS
+address without `/xml/` is a different topic: the hub verifies and renews a
+subscription to it as happily as to the real one, but YouTube stopped
+publishing to it (the hub's `topic-details` page showed its last ping on
+2024-12-22). Until 2026-11-18 every subscription here used the RSS address,
+and only a few upload-heavy channels ever pushed. A row stored with an older
+topic is moved to `subs::topic_for`'s on load and resubscribed on the next
+renew tick, keeping its callback token and secret; the old lease runs out.
+
+To see what the hub has for a topic:
+
+```sh
+curl -s 'https://pubsubhubbub.appspot.com/topic-details?hub.url=https%3A%2F%2Fwww.youtube.com%2Fxml%2Ffeeds%2Fvideos.xml%3Fchannel_id%3DUCxxxxxxxxxxxxxxxxxxxxxx'
+```
